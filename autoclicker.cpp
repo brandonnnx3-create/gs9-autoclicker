@@ -491,10 +491,23 @@ void ActualizarDiagnostico() {
     bool shift = ShiftApretado();
     bool permite = mc && (jugando || shift);
 
-    std::wstring t = L"MC:";
+    CURSORINFO ci = { 0 };
+    ci.cbSize = sizeof(CURSORINFO);
+    bool okInfo = GetCursorInfo(&ci) != FALSE;
+    bool showing = okInfo && (ci.flags & CURSOR_SHOWING) != 0;
+    bool hayHandle = okInfo && ci.hCursor != NULL;
+
+    std::wstring t = L"Show:";
+    t += showing ? L"1" : L"0";
+    t += L"  hCur:";
+    t += hayHandle ? L"1" : L"0";
+    t += L"  Clip:";
+    t += RatonEstaConfinado() ? L"1" : L"0";
+    t += L"  Shift:";
+    t += shift ? L"1" : L"0";
+    t += L"\r\nMinecraft:";
     t += mc ? L"si" : L"no";
-    t += jugando ? L"  Cursor:oculto" : L"  Cursor:visible";
-    t += shift ? L"  Shift:si" : L"  Shift:no";
+    t += jugando ? L"  Cursor:OCULTO" : L"  Cursor:VISIBLE";
     t += permite ? L"  -> CLICKEA" : L"  -> bloqueado";
     SetTextoSiCambio(hLabelDeteccion, t);
 
@@ -534,10 +547,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             WS_CHILD | WS_VISIBLE | SS_CENTER, 10, 176, 260, 44, hwnd, NULL, NULL, NULL);
 
         hLabelDeteccion = CreateWindowExW(0, L"STATIC", L"",
-            WS_CHILD | WS_VISIBLE | SS_CENTER, 10, 226, 260, 18, hwnd, NULL, NULL, NULL);
+            WS_CHILD | WS_VISIBLE | SS_CENTER, 10, 226, 260, 32, hwnd, NULL, NULL, NULL);
 
         hLabelContador = CreateWindowExW(0, L"STATIC", L"Clicks generados: 0",
-            WS_CHILD | WS_VISIBLE | SS_CENTER, 10, 246, 260, 18, hwnd, NULL, NULL, NULL);
+            WS_CHILD | WS_VISIBLE | SS_CENTER, 10, 262, 260, 18, hwnd, NULL, NULL, NULL);
 
         ActualizarLabelHotkey();
 
@@ -600,7 +613,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
 
     hMain = CreateWindowExW(0, claseName, L"Autoclicker - C++",
         WS_OVERLAPPEDWINDOW & ~WS_MAXIMIZEBOX & ~WS_THICKFRAME,
-        CW_USEDEFAULT, CW_USEDEFAULT, 300, 320,
+        CW_USEDEFAULT, CW_USEDEFAULT, 300, 340,
         NULL, NULL, hInstance, NULL);
 
     ShowWindow(hMain, nCmdShow);
