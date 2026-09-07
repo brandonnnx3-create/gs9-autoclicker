@@ -1,4 +1,4 @@
-// ============================================================================
+﻿// ============================================================================
 // Autoclicker en C++ (Win32 nativo)
 // ----------------------------------------------------------------------------
 // Ventajas sobre la versión en Python: al ser código compilado y no interpretado,
@@ -13,13 +13,24 @@
 // - Shift + click en el slider = escribir el número a mano.
 // - Contador de clicks generados, visible en la ventana.
 //
+// REGLA DE CUÁNDO CLICKEA (lo importante):
+//   1. La ventana en primer plano tiene que ser Minecraft (javaw.exe/java.exe).
+//   2. Si el CURSOR ESTÁ OCULTO (estás jugando) -> clickea.
+//   3. Si el CURSOR ESTÁ VISIBLE (inventario, menú de pausa, chat) -> NO clickea,
+//      SALVO que mantengas SHIFT apretado. Eso permite bajar pociones rápido
+//      con shift+click en el inventario, sin spamear el menú de pausa.
+//
 // Compilación: ver instrucciones que te paso aparte (Visual Studio recomendado).
 // ============================================================================
 
 #include <windows.h>
+#include <windowsx.h>   // GET_X_LPARAM (maneja coordenadas negativas bien)
 #include <commctrl.h>
+#include <mmsystem.h>   // timeBeginPeriod
 #include <thread>
 #include <atomic>
+#include <mutex>
+#include <condition_variable>
 #include <chrono>
 #include <sstream>
 #include <iomanip>
@@ -27,6 +38,7 @@
 #include <cwctype>
 
 #pragma comment(lib, "comctl32.lib")
+#pragma comment(lib, "winmm.lib")
 #pragma comment(linker, "\"/manifestdependency:type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
 
 // ---------------- IDs DE CONTROLES ----------------
@@ -48,12 +60,17 @@ std::atomic<long long> g_contador{ 0 };
 
 const DWORD TECLA_EMERGENCIA = VK_F9;
 
+// Para poder cortar el hilo de clicks al instante al cerrar, sin esperar a que
+// termine el sleep (con CPS bajísimos el sleep puede durar minutos).
+std::mutex g_mtxSalida;
+std::condition_variable g_cvSalida;
+
 HHOOK g_hMouseHook = NULL;
 HHOOK g_hKeyboardHook = NULL;
 std::thread g_hiloClicks;
 
 HWND hMain, hLabelEstado, hLabelHotkey, hLabelEmergencia, hBtnHotkey;
-HWND hLabelCps, hSliderCps, hLabelAyuda;
+HWND hLabelCps, hSliderCps, hLabelAyuda, hLabelDeteccion, hLabelContador;
 WNDPROC g_oldSliderProc = nullptr;
 
 // ---------------- UTILIDADES ----------------
@@ -65,6 +82,13 @@ std::wstring NombreTecla(DWORD vk) {
         return std::wstring(buffer);
     }
     return L"Desconocida";
+}
+
+// Evita el parpadeo de los STATIC: solo reescribe si el texto cambió.
+void SetTextoSiCambio(HWND h, const std::wstring& nuevo) {
+    wchar_t actual[256] = { 0 };
+    GetWindowTextW(h, actual, 256);
+    if (nuevo != actual) SetWindowTextW(h, nuevo.c_str());
 }
 
 void ActualizarLabelEstado() {
@@ -97,41 +121,66 @@ void EnviarClick() {
     // así el hook de mouse los distingue solo de los tuyos reales.
 }
 
-// ---------------- HILO QUE HACE LOS CLICKS ----------------
+// ---------------- DETECCIÓN DE CONTEXTO ----------------
 
-// Chequeo extra de seguridad: solo permitimos clickear si la ventana en
-// primer plano pertenece a Minecraft (javaw.exe / java.exe). Así, si alt-tabeás
-// a Discord, el navegador, o el escritorio con el sistema armado, no clickea ahí.
+// Chequeo de seguridad: solo clickeamos si la ventana en primer plano pertenece
+// a Minecraft (javaw.exe / java.exe). Si alt-tabeás a Discord, el navegador, o
+// el escritorio con el sistema armado, no clickea ahí.
+//
+// Cacheado por HWND: abrir el proceso en cada iteración (hasta 50 veces por
+// segundo) es caro y además el proceso de una ventana nunca cambia.
 bool VentanaActivaEsMinecraft() {
     HWND hFront = GetForegroundWindow();
     if (!hFront) return false;
 
+    static std::atomic<HWND> ultimaVentana{ NULL };
+    static std::atomic<bool> ultimoResultado{ false };
+    if (hFront == ultimaVentana.load()) return ultimoResultado.load();
+
+    bool resultado = false;
     DWORD pid = 0;
     GetWindowThreadProcessId(hFront, &pid);
-    if (pid == 0) return false;
+    if (pid != 0) {
+        HANDLE hProc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+        if (hProc) {
+            wchar_t ruta[MAX_PATH];
+            DWORD tam = MAX_PATH;
+            if (QueryFullProcessImageNameW(hProc, 0, ruta, &tam)) {
+                std::wstring rutaStr(ruta);
+                size_t pos = rutaStr.find_last_of(L"\\/");
+                std::wstring nombre = (pos == std::wstring::npos) ? rutaStr : rutaStr.substr(pos + 1);
+                for (auto& c : nombre) c = towlower(c);
+                resultado = (nombre == L"javaw.exe" || nombre == L"java.exe");
+            }
+            CloseHandle(hProc);
+        }
+    }
 
-    HANDLE hProc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
-    if (!hProc) return false;
-
-    wchar_t ruta[MAX_PATH];
-    DWORD tam = MAX_PATH;
-    bool ok = QueryFullProcessImageNameW(hProc, 0, ruta, &tam);
-    CloseHandle(hProc);
-    if (!ok) return false;
-
-    std::wstring rutaStr(ruta);
-    size_t pos = rutaStr.find_last_of(L"\\/");
-    std::wstring nombre = (pos == std::wstring::npos) ? rutaStr : rutaStr.substr(pos + 1);
-    for (auto& c : nombre) c = towlower(c);
-
-    return (nombre == L"javaw.exe" || nombre == L"java.exe");
+    ultimaVentana = hFront;
+    ultimoResultado = resultado;
+    return resultado;
 }
 
-// La mayoría de los juegos en primera persona "confiscan" el mouse (lo confinan
-// a la ventana) mientras estás jugando activamente, y lo liberan al abrir
-// cualquier menú. Es una señal más confiable que las teclas, porque no importa
-// CÓMO volviste a jugar (teclado o mouse).
-bool RatonEstaCapturado() {
+// SEÑAL PRINCIPAL: ¿el cursor está oculto?
+// Cuando estás jugando, Minecraft esconde el puntero. Cuando abrís el
+// inventario, el menú de pausa o el chat, lo vuelve a mostrar.
+// A diferencia de mirar el teclado, esto no depende de CÓMO saliste del menú
+// (con Escape o clickeando "Back to Game"), y a diferencia de GetClipCursor,
+// sigue funcionando en pantalla completa.
+bool CursorEstaOculto() {
+    CURSORINFO ci = { 0 };
+    ci.cbSize = sizeof(CURSORINFO);
+    if (!GetCursorInfo(&ci)) return false;  // ante la duda, asumimos "visible"
+    // flags: 0 = oculto, CURSOR_SHOWING = visible, CURSOR_SUPPRESSED = táctil.
+    // hCursor NULL también significa que nadie está dibujando puntero.
+    return (ci.flags & CURSOR_SHOWING) == 0 || ci.hCursor == NULL;
+}
+
+// SEÑAL SECUNDARIA (red de respaldo): los juegos en primera persona confinan el
+// mouse a la ventana mientras jugás y lo liberan al abrir un menú.
+// Ojo: en pantalla completa con un solo monitor, el área confinada coincide con
+// toda la pantalla y esta señal deja de distinguir nada. Por eso es secundaria.
+bool RatonEstaConfinado() {
     RECT clip;
     if (!GetClipCursor(&clip)) return false;
 
@@ -141,27 +190,82 @@ bool RatonEstaCapturado() {
     pantalla.right = pantalla.left + GetSystemMetrics(SM_CXVIRTUALSCREEN);
     pantalla.bottom = pantalla.top + GetSystemMetrics(SM_CYVIRTUALSCREEN);
 
-    // Si el área permitida para el mouse es MENOR que toda la pantalla, algo
-    // (probablemente el juego) lo está reteniendo para el modo de juego.
     return (clip.left > pantalla.left || clip.top > pantalla.top ||
             clip.right < pantalla.right || clip.bottom < pantalla.bottom);
 }
 
-bool PermiteClickPorMenu() {
+// "Estás jugando" = el cursor desapareció de la pantalla.
+// El OR con el confinamiento solo puede AGREGAR detección de "jugando"; en un
+// menú ninguna de las dos da true, así que no arruina el caso del inventario.
+bool EstaJugando() {
+    return CursorEstaOculto() || RatonEstaConfinado();
+}
+
+bool ShiftApretado() {
+    return (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
+}
+
+// LA REGLA COMPLETA.
+bool PermiteClick() {
     if (!VentanaActivaEsMinecraft()) return false;
-    return RatonEstaCapturado();
+    if (EstaJugando()) return true;   // cursor oculto -> jugando -> clickea
+    return ShiftApretado();           // cursor visible -> solo con Shift
+}
+
+// ---------------- HILO QUE HACE LOS CLICKS ----------------
+
+// Duerme como máximo `d`, pero se despierta enseguida si se pidió cerrar.
+template <class Dur>
+void DormirInterrumpible(Dur d) {
+    std::unique_lock<std::mutex> lock(g_mtxSalida);
+    g_cvSalida.wait_for(lock, d, [] { return !g_running.load(); });
 }
 
 void HiloClicks() {
+    using reloj = std::chrono::steady_clock;
+    auto proximoClick = reloj::now();
+    bool enRafaga = false;
+
     while (g_running) {
-        if (g_sistemaActivo && g_mouseApretado && g_cps.load() > 0.0 && PermiteClickPorMenu()) {
-            EnviarClick();
-            g_contador++;
-            double intervalo = 1.0 / g_cps.load();
-            std::this_thread::sleep_for(std::chrono::duration<double>(intervalo));
-        } else {
-            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        double cps = g_cps.load();
+
+        // El hook puede perderse un "botón soltado" (por ejemplo si Windows
+        // muestra la pantalla segura de UAC justo en ese momento). Si eso pasa,
+        // el estado quedaría trabado en "apretado" y clickearía solo. Esto lo
+        // reconcilia contra el estado real del botón.
+        if (g_mouseApretado && !(GetAsyncKeyState(VK_LBUTTON) & 0x8000))
+            g_mouseApretado = false;
+
+        if (!(g_sistemaActivo && g_mouseApretado && cps > 0.0 && PermiteClick())) {
+            enRafaga = false;
+            DormirInterrumpible(std::chrono::milliseconds(5));
+            continue;
         }
+
+        auto ahora = reloj::now();
+        if (!enRafaga) {          // primer click de la ráfaga: sale ya
+            enRafaga = true;
+            proximoClick = ahora;
+        }
+
+        if (ahora < proximoClick) {
+            // Esperamos de a 50ms como mucho, para reaccionar rápido si soltás
+            // el botón o movés el slider en el medio.
+            auto falta = proximoClick - ahora;
+            auto tope = std::chrono::milliseconds(50);
+            DormirInterrumpible(falta < tope ? falta : std::chrono::duration_cast<reloj::duration>(tope));
+            continue;
+        }
+
+        EnviarClick();
+        g_contador++;
+
+        // Deadline absoluto en vez de "dormir 1/cps": así el tiempo que tarda
+        // SendInput no se va acumulando como atraso click tras click.
+        auto intervalo = std::chrono::duration_cast<reloj::duration>(
+            std::chrono::duration<double>(1.0 / cps));
+        proximoClick += intervalo;
+        if (proximoClick < ahora) proximoClick = ahora;  // si nos atrasamos, reanclamos
     }
 }
 
@@ -213,6 +317,7 @@ LRESULT CALLBACK KeyboardHookProc(int nCode, WPARAM wParam, LPARAM lParam) {
 // ---------------- VENTANA EMERGENTE PARA ESCRIBIR EL CPS A MANO ----------------
 double g_valorPopup = 10.0;
 bool g_popupOk = false;
+bool g_popupCerrado = false;
 
 LRESULT CALLBACK PopupProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     static HWND hEdit;
@@ -230,8 +335,9 @@ LRESULT CALLBACK PopupProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         SetFocus(hEdit);
         break;
     }
-    case WM_COMMAND:
-        if (LOWORD(wParam) == IDC_BTN_OK) {
+    case WM_COMMAND: {
+        WORD id = LOWORD(wParam);
+        if (id == IDC_BTN_OK || id == IDOK) {   // IDOK = tecla Enter
             wchar_t buf[32];
             GetWindowTextW(hEdit, buf, 32);
             double v = wcstod(buf, NULL);
@@ -240,17 +346,21 @@ LRESULT CALLBACK PopupProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             g_valorPopup = v;
             g_popupOk = true;
             DestroyWindow(hwnd);
-        } else if (LOWORD(wParam) == IDC_BTN_CANCEL) {
+        } else if (id == IDC_BTN_CANCEL || id == IDCANCEL) {  // IDCANCEL = Escape
             g_popupOk = false;
             DestroyWindow(hwnd);
         }
         break;
+    }
     case WM_CLOSE:
         g_popupOk = false;
         DestroyWindow(hwnd);
         break;
     case WM_DESTROY:
-        PostQuitMessage(0);
+        // OJO: acá NO va PostQuitMessage. El popup corre un loop de mensajes
+        // anidado dentro del loop principal, así que un WM_QUIT le cerraría
+        // la aplicación entera al salir del popup.
+        g_popupCerrado = true;
         break;
     default:
         return DefWindowProcW(hwnd, msg, wParam, lParam);
@@ -277,15 +387,22 @@ bool PedirCpsManual(HWND parent, double actual, double* resultado) {
 
     g_valorPopup = actual;
     g_popupOk = false;
+    g_popupCerrado = false;
     EnableWindow(parent, FALSE);
 
     HWND hPopup = CreateWindowExW(WS_EX_DLGMODALFRAME, claseName, L"Configurar CPS",
         WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
         CW_USEDEFAULT, CW_USEDEFAULT, 230, 120, parent, NULL, GetModuleHandleW(NULL), NULL);
 
+    if (!hPopup) {          // si la ventana no se pudo crear, no entramos al loop
+        EnableWindow(parent, TRUE);
+        return false;
+    }
+
     MSG msg;
-    while (GetMessageW(&msg, NULL, 0, 0)) {
-        if (!IsWindow(hPopup)) break;
+    bool huboQuit = false;
+    while (!g_popupCerrado) {
+        if (!GetMessageW(&msg, NULL, 0, 0)) { huboQuit = true; break; }
         if (!IsDialogMessageW(hPopup, &msg)) {
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
@@ -294,6 +411,10 @@ bool PedirCpsManual(HWND parent, double actual, double* resultado) {
 
     EnableWindow(parent, TRUE);
     SetForegroundWindow(parent);
+
+    // Si mientras el popup estaba abierto se pidió cerrar el programa entero,
+    // reenviamos el WM_QUIT para que el loop principal también termine.
+    if (huboQuit) PostQuitMessage((int)msg.wParam);
 
     if (g_popupOk) {
         *resultado = g_valorPopup;
@@ -305,13 +426,18 @@ bool PedirCpsManual(HWND parent, double actual, double* resultado) {
 // ---------------- SUBCLASE DEL SLIDER (para detectar Shift+Click y click-directo) ----------------
 bool g_arrastrandoSlider = false;
 
-int PosDesdeX(HWND hwnd, LONG x) {
+int PosDesdeX(HWND hwnd, int x) {
     RECT canal;
     SendMessageW(hwnd, TBM_GETCHANNELRECT, 0, (LPARAM)&canal);
-    double proporcion = (double)(x - canal.left) / (double)(canal.right - canal.left);
+    int minPos = (int)SendMessageW(hwnd, TBM_GETRANGEMIN, 0, 0);
+    int maxPos = (int)SendMessageW(hwnd, TBM_GETRANGEMAX, 0, 0);
+    LONG ancho = canal.right - canal.left;
+    if (ancho <= 0) return minPos;
+
+    double proporcion = (double)(x - canal.left) / (double)ancho;
     if (proporcion < 0) proporcion = 0;
     if (proporcion > 1) proporcion = 1;
-    return (int)(1 + proporcion * (50000 - 1));
+    return minPos + (int)(proporcion * (maxPos - minPos));
 }
 
 LRESULT CALLBACK SliderSubclassProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
@@ -328,7 +454,10 @@ LRESULT CALLBACK SliderSubclassProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
         } else {
             // Click directo en cualquier parte de la barra: saltamos ahí mismo,
             // en vez del incremento chiquito que hace el control por defecto.
-            int nuevaPos = PosDesdeX(hwnd, LOWORD(lParam));
+            // GET_X_LPARAM y no LOWORD: con SetCapture las coordenadas pueden
+            // ser negativas (arrastrás fuera del control por la izquierda) y
+            // LOWORD las convertiría en un número gigante.
+            int nuevaPos = PosDesdeX(hwnd, GET_X_LPARAM(lParam));
             SendMessageW(hwnd, TBM_SETPOS, TRUE, nuevaPos);
             g_cps = nuevaPos / 1000.0;
             ActualizarLabelCps(g_cps.load());
@@ -338,7 +467,7 @@ LRESULT CALLBACK SliderSubclassProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
         }
     }
     if (msg == WM_MOUSEMOVE && g_arrastrandoSlider) {
-        int nuevaPos = PosDesdeX(hwnd, LOWORD(lParam));
+        int nuevaPos = PosDesdeX(hwnd, GET_X_LPARAM(lParam));
         SendMessageW(hwnd, TBM_SETPOS, TRUE, nuevaPos);
         g_cps = nuevaPos / 1000.0;
         ActualizarLabelCps(g_cps.load());
@@ -350,6 +479,26 @@ LRESULT CALLBACK SliderSubclassProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
         return 0;
     }
     return CallWindowProcW(g_oldSliderProc, hwnd, msg, wParam, lParam);
+}
+
+// ---------------- PANEL DE DIAGNÓSTICO ----------------
+// Muestra en vivo qué está viendo el programa. Sirve para verificar en tu
+// máquina que la detección del cursor funciona (sobre todo en pantalla
+// completa, que es donde la señal vieja fallaba).
+void ActualizarDiagnostico() {
+    bool mc = VentanaActivaEsMinecraft();
+    bool jugando = EstaJugando();
+    bool shift = ShiftApretado();
+    bool permite = mc && (jugando || shift);
+
+    std::wstring t = L"MC:";
+    t += mc ? L"si" : L"no";
+    t += jugando ? L"  Cursor:oculto" : L"  Cursor:visible";
+    t += shift ? L"  Shift:si" : L"  Shift:no";
+    t += permite ? L"  -> CLICKEA" : L"  -> bloqueado";
+    SetTextoSiCambio(hLabelDeteccion, t);
+
+    SetTextoSiCambio(hLabelContador, L"Clicks generados: " + std::to_wstring(g_contador.load()));
 }
 
 // ---------------- VENTANA PRINCIPAL ----------------
@@ -379,14 +528,23 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         // Subclase del slider para detectar shift+click
         g_oldSliderProc = (WNDPROC)SetWindowLongPtrW(hSliderCps, GWLP_WNDPROC, (LONG_PTR)SliderSubclassProc);
 
-        hLabelAyuda = CreateWindowExW(0, L"STATIC", L"Shift + click en el slider para escribir el n\u00famero a mano",
-            WS_CHILD | WS_VISIBLE | SS_CENTER, 10, 175, 260, 32, hwnd, NULL, NULL, NULL);
+        hLabelAyuda = CreateWindowExW(0, L"STATIC",
+            L"Shift + click en el slider = escribir el n\u00famero a mano.\r\n"
+            L"En inventario/men\u00fa no clickea, salvo que mantengas SHIFT.",
+            WS_CHILD | WS_VISIBLE | SS_CENTER, 10, 176, 260, 44, hwnd, NULL, NULL, NULL);
+
+        hLabelDeteccion = CreateWindowExW(0, L"STATIC", L"",
+            WS_CHILD | WS_VISIBLE | SS_CENTER, 10, 226, 260, 18, hwnd, NULL, NULL, NULL);
+
+        hLabelContador = CreateWindowExW(0, L"STATIC", L"Clicks generados: 0",
+            WS_CHILD | WS_VISIBLE | SS_CENTER, 10, 246, 260, 18, hwnd, NULL, NULL, NULL);
 
         ActualizarLabelHotkey();
 
         g_hMouseHook = SetWindowsHookExW(WH_MOUSE_LL, MouseHookProc, GetModuleHandleW(NULL), 0);
         g_hKeyboardHook = SetWindowsHookExW(WH_KEYBOARD_LL, KeyboardHookProc, GetModuleHandleW(NULL), 0);
 
+        SetTimer(hwnd, ID_TIMER_CONTADOR, 100, NULL);
         g_hiloClicks = std::thread(HiloClicks);
         break;
     }
@@ -395,6 +553,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             g_esperandoNuevaTecla = true;
             SetWindowTextW(hLabelHotkey, L"Presion\u00e1 una tecla...");
         }
+        break;
+    case WM_TIMER:
+        if (wParam == ID_TIMER_CONTADOR) ActualizarDiagnostico();
         break;
     case WM_HSCROLL:
         if ((HWND)lParam == hSliderCps) {
@@ -405,7 +566,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         }
         break;
     case WM_DESTROY:
+        KillTimer(hwnd, ID_TIMER_CONTADOR);
         g_running = false;
+        g_cvSalida.notify_all();   // despierta el hilo aunque esté en un sleep largo
         if (g_hiloClicks.joinable()) g_hiloClicks.join();
         if (g_hMouseHook) UnhookWindowsHookEx(g_hMouseHook);
         if (g_hKeyboardHook) UnhookWindowsHookEx(g_hKeyboardHook);
@@ -422,6 +585,10 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
     INITCOMMONCONTROLSEX icc = { sizeof(icc), ICC_BAR_CLASSES };
     InitCommonControlsEx(&icc);
 
+    // Sin esto, Windows despierta los sleeps cada ~15.6ms y los CPS reales
+    // quedan muy por debajo de los configurados (pedir 20 CPS da ~16).
+    timeBeginPeriod(1);
+
     const wchar_t* claseName = L"AutoclickerMainClass";
     WNDCLASSW wc = {};
     wc.lpfnWndProc = WndProc;
@@ -433,7 +600,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
 
     hMain = CreateWindowExW(0, claseName, L"Autoclicker - C++",
         WS_OVERLAPPEDWINDOW & ~WS_MAXIMIZEBOX & ~WS_THICKFRAME,
-        CW_USEDEFAULT, CW_USEDEFAULT, 300, 260,
+        CW_USEDEFAULT, CW_USEDEFAULT, 300, 320,
         NULL, NULL, hInstance, NULL);
 
     ShowWindow(hMain, nCmdShow);
@@ -445,5 +612,6 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
         DispatchMessageW(&msg);
     }
 
+    timeEndPeriod(1);
     return 0;
 }
