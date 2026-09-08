@@ -252,13 +252,13 @@ void HiloClicks() {
     while (g_running) {
         double cps = g_cps.load();
 
-        // El hook puede perderse un "botón soltado" (por ejemplo si Windows
-        // muestra la pantalla segura de UAC justo en ese momento). Si eso pasa,
-        // el estado quedaría trabado en "apretado" y clickearía solo. Esto lo
-        // reconcilia contra el estado real del botón.
-        if (g_mouseApretado && !(GetAsyncKeyState(VK_LBUTTON) & 0x8000))
-            g_mouseApretado = false;
-
+        // NOTA: acá hubo una "reconciliación" que leía GetAsyncKeyState(VK_LBUTTON)
+        // para el caso de que el hook perdiera el evento de soltar. Se sacó: los
+        // propios clicks que este programa manda con SendInput pisan ese mismo
+        // estado global (el LEFTUP sintético queda registrado como "botón
+        // suelto" para GetAsyncKeyState), así que cortaba el autoclicker después
+        // del primer click SIEMPRE, no solo en el caso raro que se quería cubrir.
+        // El hook de mouse (que sí filtra LLMHF_INJECTED) es la señal correcta.
         if (!(g_sistemaActivo && g_mouseApretado && cps > 0.0 && PermiteClick())) {
             enRafaga = false;
             DormirInterrumpible(std::chrono::milliseconds(5));
