@@ -331,7 +331,6 @@ void MuestrearSeniales() {
     const long TOLERANCIA_CENTRO = 10;   // qué tan cerca del centro cuenta como "volvió"
     const long CORTE_INMEDIATO   = 200;  // tan lejos del centro que no puede estar jugando
     const ULONGLONG VENTANA_APAGADO = 120;   // ms sin volver al centro -> menú
-    const ULONGLONG EXPIRA_SIN_MOVER = 2000; // ver comentario abajo
 
     // Cuantas vueltas al pixel exacto del centro hacen falta para armar, y en
     // cuanto tiempo. Jugando y moviendo la mano, el juego produce una por cuadro:
@@ -344,20 +343,15 @@ void MuestrearSeniales() {
     // para siempre la heurística que sí funciona, así que se pide evidencia.
     const long MUESTRAS_PARA_CONFIAR = 30;   // ~450 ms de juego
 
-    static long long ultimosMovimientos = 0;
     static ULONGLONG ultimoPasoPorCentro = 0;
-    static ULONGLONG ultimoMovimiento = 0;
     static ULONGLONG ultimaRotacion = 0;
-    static bool confirmado = false;
-
-    long long movs = g_movimientos.load();
-    bool huboMovimiento = (movs != ultimosMovimientos);
-    ultimosMovimientos = movs;
+    static bool estabaAfuera = false;
+    static ULONGLONG retornos[RETORNOS_PARA_ARMAR] = { 0 };
+    static int idxRetorno = 0;
 
     if (!VentanaActivaEsMinecraft()) return;   // fuera de Minecraft no tocamos nada
 
     ULONGLONG ahora = GetTickCount64();
-    if (huboMovimiento) ultimoMovimiento = ahora;
 
     // --- calibración de la señal de cursor oculto ---
     bool oculto = CursorEstaOculto();
@@ -368,66 +362,68 @@ void MuestrearSeniales() {
     }
 
     // --- heurística del cursor secuestrado ---
+    //
+    // El estado por defecto es JUGANDO, no "menu". Jugar es lo que hacés el 95%
+    // del tiempo, y exigir evidencia para empezar a clickear obligaba a mover el
+    // mouse antes de que el programa respondiera: inaceptable en PvP.
+    //
+    // Entonces esto no detecta "estas jugando" sino lo contrario: detecta que se
+    // ABRIO un menu, y ahi apaga. Mientras no haya evidencia de menu, clickea.
+    static bool menuAbierto = false;
+
     long d = DistanciaAlCentro();
     g_distCentro = d;
 
-    // Mantener vivo: el cursor sigue apareciendo cerca del centro.
+    if (!ultimoPasoPorCentro) ultimoPasoPorCentro = ahora;   // arranque
     if (d >= 0 && d <= TOLERANCIA_CENTRO) ultimoPasoPorCentro = ahora;
-    g_msDesdeCentro = ultimoPasoPorCentro ? (long long)(ahora - ultimoPasoPorCentro) : -1;
+    g_msDesdeCentro = (long long)(ahora - ultimoPasoPorCentro);
 
-    // --- ARMADO ---
-    // Antes alcanzaba con "cursor cerca del centro + hubo movimiento", y eso se
-    // volvia a armar solo dentro de un menu: en el menu de pausa el cursor queda
-    // en el centro y con que tiemble la mano un par de pixeles la condicion se
-    // cumplia de nuevo 15 ms despues de haberlo apagado.
+    // --- SE ABRIO UN MENU (cualquiera de estas alcanza) ---
+
+    // Teclado: E y Escape. Inmediato y sin falsos negativos. Se usan solo para
+    // apagar, nunca para encender: mirar el teclado no sirve para saber cuando
+    // volves a jugar, porque un menu se puede cerrar clickeando "Back to Game".
+    if (g_pedidoApagarWarp.exchange(false)) {
+        menuAbierto = true;
+        for (int i = 0; i < RETORNOS_PARA_ARMAR; i++) retornos[i] = 0;
+    }
+
+    // El cursor se fue muy lejos del centro: jugando eso no se sostiene, porque
+    // el juego lo devolveria en el cuadro siguiente.
+    if (d > CORTE_INMEDIATO) menuAbierto = true;
+
+    // Hace rato que el cursor no aparece cerca del centro: anda suelto.
+    if ((ahora - ultimoPasoPorCentro) > VENTANA_APAGADO) menuAbierto = true;
+
+    // --- SE VOLVIO AL JUEGO ---
     //
-    // Ahora se exige algo que SOLO el juego puede producir: que el cursor vuelva
-    // al PIXEL EXACTO del centro varias veces seguidas. El juego lo pone ahi en
-    // cada cuadro; una mano temblando lo deja cerca del centro, pero no en el
-    // mismo pixel exacto una y otra vez.
-    static bool estabaAfuera = false;
-    static ULONGLONG retornos[RETORNOS_PARA_ARMAR] = { 0 };
-    static int idxRetorno = 0;
-
+    // Se exige algo que SOLO el juego produce: que el cursor vuelva al PIXEL
+    // EXACTO del centro varias veces seguidas. El juego lo pone ahi en cada
+    // cuadro; una mano apoyada dentro de un menu lo deja cerca del centro, pero
+    // no en el mismo pixel exacto una y otra vez.
+    //
+    // Ojo: esto NO hace falta para clickear desde el arranque ni para seguir
+    // clickeando con el mouse quieto. Solo hace falta para SALIR del estado
+    // "menu", y ahi alcanza con mover la mano: jugando sale una vuelta por
+    // cuadro, asi que tres tardan unos 50 ms.
     if (d == 0 && estabaAfuera) {
         retornos[idxRetorno] = ahora;
         idxRetorno = (idxRetorno + 1) % RETORNOS_PARA_ARMAR;
         g_retornos = g_retornos.load() + 1;
-        // Tras avanzar, esta posicion guarda el mas viejo de los ultimos N.
-        ULONGLONG masViejo = retornos[idxRetorno];
-        if (masViejo && (ahora - masViejo) <= VENTANA_RETORNOS) confirmado = true;
+        ULONGLONG masViejo = retornos[idxRetorno];   // tras avanzar, el mas viejo de los N
+        if (masViejo && (ahora - masViejo) <= VENTANA_RETORNOS) menuAbierto = false;
     }
     if (d > 0) estabaAfuera = true;
     else if (d == 0) estabaAfuera = false;
 
-    // --- APAGADO ---
-    // Se abrio un menu con el teclado: cortar ya, sin esperar a la heuristica.
-    // Esto es lo que cubre el menu de pausa y el inventario, donde el cursor
-    // queda en el centro y sin movimiento no hay nada que observar.
-    if (g_pedidoApagarWarp.exchange(false)) {
-        confirmado = false;
-        for (int i = 0; i < RETORNOS_PARA_ARMAR; i++) retornos[i] = 0;  // que no rearme con retornos viejos
-    }
-
-    if (d > CORTE_INMEDIATO) confirmado = false;
-    if (!ultimoPasoPorCentro || (ahora - ultimoPasoPorCentro) > VENTANA_APAGADO) confirmado = false;
-
-    // Punto ciego irreducible de esta heurística: con el mouse totalmente quieto
-    // y el cursor en el centro, jugar y tener el inventario abierto son
-    // indistinguibles (el juego deja el cursor en el centro en los dos casos).
-    // Ante esa duda se elige NO clickear: un click de más en el inventario tira
-    // objetos, y para que vuelva a clickear alcanza con mover el mouse.
-    // Solo aplica a esta heurística; las otras dos capas no tienen este problema.
-    if (ultimoMovimiento && (ahora - ultimoMovimiento) > EXPIRA_SIN_MOVER) confirmado = false;
-
-    g_juegoWarpeaCursor = confirmado;
+    g_juegoWarpeaCursor = !menuAbierto;
 
     // --- snapshot para el panel ---
     Muestra m;
     m.valida = true;
     m.oculto = oculto;
     m.clip = RatonEstaConfinado();
-    m.warp = confirmado;
+    m.warp = !menuAbierto;
     m.full = VentanaEnPantallaCompleta();
     m.shift = ShiftApretado();
     m.dist = d;
