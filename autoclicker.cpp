@@ -82,7 +82,7 @@ std::atomic<double> g_cps{ 10.0 };
 std::atomic<DWORD> g_hotkeyVK{ VK_F6 };
 std::atomic<long long> g_contador{ 0 };
 std::atomic<long long> g_movimientos{ 0 };      // movimientos REALES del mouse
-std::atomic<bool> g_juegoWarpeaCursor{ false }; // ver DetectarWarpDelCursor()
+std::atomic<bool> g_juegoWarpeaCursor{ true };  // arranca en "jugando": ver MuestrearSeniales()
 std::atomic<long> g_distCentro{ -1 };           // px del cursor al centro (diagnostico)
 std::atomic<long long> g_msDesdeCentro{ -1 };   // ms desde el ultimo paso por el centro
 std::atomic<bool> g_senalCursorSirve{ false };  // GetCursorInfo demostro servir aca
@@ -327,15 +327,15 @@ Muestra g_muestraReciente, g_muestraVieja;
 
 // Se llama desde el timer de la ventana cada 15 ms.
 void MuestrearSeniales() {
-    // --- parámetros de la heurística del cursor secuestrado ---
-    const long TOLERANCIA_CENTRO = 10;   // qué tan cerca del centro cuenta como "volvió"
-    const long CORTE_INMEDIATO   = 200;  // tan lejos del centro que no puede estar jugando
-    const ULONGLONG VENTANA_APAGADO = 120;   // ms sin volver al centro -> menú
+    // El cursor no puede sostenerse tan lejos del centro mientras jugás: el
+    // juego lo devuelve al centro en cada cuadro. Si se queda lejos, anda suelto.
+    const long LEJOS = 150;
+    const ULONGLONG LEJOS_SOSTENIDO = 200;   // ms lejos, seguidos
 
-    // Cuantas vueltas al pixel exacto del centro hacen falta para armar, y en
-    // cuanto tiempo. Jugando y moviendo la mano, el juego produce una por cuadro:
-    // tres tardan ~50 ms. Dentro de un menu no se producen practicamente nunca.
-    const int RETORNOS_PARA_ARMAR = 3;
+    // Para que una vuelta al centro cuente como "el juego lo trajo", el cursor
+    // tiene que haber estado a esta distancia antes. Filtra el temblor de la mano.
+    const long EXCURSION_MINIMA = 20;
+    const int RETORNOS_PARA_VOLVER = 2;
     const ULONGLONG VENTANA_RETORNOS = 500;
 
     // Cuántas muestras seguidas hay que ver el cursor oculto antes de confiar en
@@ -343,11 +343,17 @@ void MuestrearSeniales() {
     // para siempre la heurística que sí funciona, así que se pide evidencia.
     const long MUESTRAS_PARA_CONFIAR = 30;   // ~450 ms de juego
 
-    static ULONGLONG ultimoPasoPorCentro = 0;
-    static ULONGLONG ultimaRotacion = 0;
-    static bool estabaAfuera = false;
-    static ULONGLONG retornos[RETORNOS_PARA_ARMAR] = { 0 };
+    // Estado por defecto: JUGANDO. Es lo que pasa el 95% del tiempo, y exigir
+    // evidencia para empezar a clickear obligaba a mover el mouse antes de que
+    // el programa respondiera. Esto no detecta "estás jugando": detecta que se
+    // ABRIO un menú, y solo entonces apaga.
+    static bool menuAbierto = false;
+    static ULONGLONG desdeCuandoLejos = 0;
+    static long maxDesdeCentro = 0;
+    static ULONGLONG retornos[RETORNOS_PARA_VOLVER] = { 0 };
     static int idxRetorno = 0;
+    static ULONGLONG ultimoCentroExacto = 0;
+    static ULONGLONG ultimaRotacion = 0;
 
     if (!VentanaActivaEsMinecraft()) return;   // fuera de Minecraft no tocamos nada
 
@@ -361,60 +367,58 @@ void MuestrearSeniales() {
         if (n >= MUESTRAS_PARA_CONFIAR) g_senalCursorSirve = true;
     }
 
-    // --- heurística del cursor secuestrado ---
-    //
-    // El estado por defecto es JUGANDO, no "menu". Jugar es lo que hacés el 95%
-    // del tiempo, y exigir evidencia para empezar a clickear obligaba a mover el
-    // mouse antes de que el programa respondiera: inaceptable en PvP.
-    //
-    // Entonces esto no detecta "estas jugando" sino lo contrario: detecta que se
-    // ABRIO un menu, y ahi apaga. Mientras no haya evidencia de menu, clickea.
-    static bool menuAbierto = false;
-
     long d = DistanciaAlCentro();
     g_distCentro = d;
+    // Si la distancia no se pudo calcular (d < 0), no se toca nada: el estado
+    // queda como estaba, que por defecto es "jugando".
 
-    if (!ultimoPasoPorCentro) ultimoPasoPorCentro = ahora;   // arranque
-    if (d >= 0 && d <= TOLERANCIA_CENTRO) ultimoPasoPorCentro = ahora;
-    g_msDesdeCentro = (long long)(ahora - ultimoPasoPorCentro);
+    // ------------------------------------------------------------------
+    // SE ABRIO UN MENU
+    // ------------------------------------------------------------------
 
-    // --- SE ABRIO UN MENU (cualquiera de estas alcanza) ---
-
-    // Teclado: E y Escape. Inmediato y sin falsos negativos. Se usan solo para
-    // apagar, nunca para encender: mirar el teclado no sirve para saber cuando
-    // volves a jugar, porque un menu se puede cerrar clickeando "Back to Game".
+    // Teclado: E y Escape. Inmediato. Se usan SOLO para apagar, nunca para
+    // encender: mirar el teclado no sirve para saber cuándo volvés a jugar,
+    // porque un menú se puede cerrar clickeando "Back to Game".
     if (g_pedidoApagarWarp.exchange(false)) {
         menuAbierto = true;
-        for (int i = 0; i < RETORNOS_PARA_ARMAR; i++) retornos[i] = 0;
+        for (int i = 0; i < RETORNOS_PARA_VOLVER; i++) retornos[i] = 0;
     }
 
-    // El cursor se fue muy lejos del centro: jugando eso no se sostiene, porque
-    // el juego lo devolveria en el cuadro siguiente.
-    if (d > CORTE_INMEDIATO) menuAbierto = true;
-
-    // Hace rato que el cursor no aparece cerca del centro: anda suelto.
-    if ((ahora - ultimoPasoPorCentro) > VENTANA_APAGADO) menuAbierto = true;
-
-    // --- SE VOLVIO AL JUEGO ---
-    //
-    // Se exige algo que SOLO el juego produce: que el cursor vuelva al PIXEL
-    // EXACTO del centro varias veces seguidas. El juego lo pone ahi en cada
-    // cuadro; una mano apoyada dentro de un menu lo deja cerca del centro, pero
-    // no en el mismo pixel exacto una y otra vez.
-    //
-    // Ojo: esto NO hace falta para clickear desde el arranque ni para seguir
-    // clickeando con el mouse quieto. Solo hace falta para SALIR del estado
-    // "menu", y ahi alcanza con mover la mano: jugando sale una vuelta por
-    // cuadro, asi que tres tardan unos 50 ms.
-    if (d == 0 && estabaAfuera) {
-        retornos[idxRetorno] = ahora;
-        idxRetorno = (idxRetorno + 1) % RETORNOS_PARA_ARMAR;
-        g_retornos = g_retornos.load() + 1;
-        ULONGLONG masViejo = retornos[idxRetorno];   // tras avanzar, el mas viejo de los N
-        if (masViejo && (ahora - masViejo) <= VENTANA_RETORNOS) menuAbierto = false;
+    // El cursor se quedó lejos del centro un rato. OJO: lo que importa es que se
+    // QUEDE lejos, no que pase por ahí. Moviendo rápido el mouse dentro del juego
+    // el cursor se aleja mucho entre cuadro y cuadro, pero siempre vuelve; medir
+    // "está lejos ahora" cortaba el click justo cuando más rápido movías.
+    if (d > LEJOS) {
+        if (!desdeCuandoLejos) desdeCuandoLejos = ahora;
+        if ((ahora - desdeCuandoLejos) > LEJOS_SOSTENIDO) menuAbierto = true;
+    } else if (d >= 0) {
+        desdeCuandoLejos = 0;
     }
-    if (d > 0) estabaAfuera = true;
-    else if (d == 0) estabaAfuera = false;
+
+    // ------------------------------------------------------------------
+    // SE VOLVIO AL JUEGO
+    // ------------------------------------------------------------------
+    // Solo hace falta para SALIR del estado "menú". Para clickear desde el
+    // arranque, o para seguir clickeando con el mouse quieto, no se necesita
+    // nada de esto.
+    //
+    // Se exige que el cursor vuelva al PIXEL EXACTO del centro después de
+    // haberse alejado de verdad. Eso solo lo produce el juego, que lo pone ahí
+    // en cada cuadro; una mano apoyada dentro de un menú lo deja cerca del
+    // centro, pero no en ese píxel exacto viniendo desde lejos.
+    if (d > maxDesdeCentro) maxDesdeCentro = d;
+    if (d == 0) {
+        ultimoCentroExacto = ahora;
+        if (maxDesdeCentro > EXCURSION_MINIMA) {
+            retornos[idxRetorno] = ahora;
+            idxRetorno = (idxRetorno + 1) % RETORNOS_PARA_VOLVER;
+            g_retornos = g_retornos.load() + 1;
+            ULONGLONG masViejo = retornos[idxRetorno];   // tras avanzar, el más viejo
+            if (masViejo && (ahora - masViejo) <= VENTANA_RETORNOS) menuAbierto = false;
+        }
+        maxDesdeCentro = 0;
+    }
+    g_msDesdeCentro = ultimoCentroExacto ? (long long)(ahora - ultimoCentroExacto) : -1;
 
     g_juegoWarpeaCursor = !menuAbierto;
 
