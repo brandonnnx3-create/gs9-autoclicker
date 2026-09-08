@@ -54,6 +54,12 @@
 #include <string>
 #include <cwctype>
 
+// user32.lib no se linkea solo desde "cl" a secas (el template de Visual
+// Studio lo agrega via "Additional Dependencies", pero eso no existe fuera
+// del proyecto). Sin esto, TODAS las funciones de User32 -CreateWindowExW,
+// RegisterClassW, GetMessageW, SendInput, los hooks, etc.- quedan sin resolver
+// al linkear (LNK2019), aunque el .cpp compile bien.
+#pragma comment(lib, "user32.lib")
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "winmm.lib")
 #pragma comment(linker, "\"/manifestdependency:type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
