@@ -228,6 +228,28 @@ bool RatonEstaConfinado() {
 // señales es confiable: en modo ventana, el confinamiento del mouse distingue
 // perfecto entre jugar y estar en un menú; en pantalla completa no distingue
 // nada, porque el área confinada pasa a ser la pantalla entera.
+// ¿La ventana en foco cubre TODO el escritorio (todos los monitores juntos)?
+// Esta es la pregunta que de verdad importa para el confinamiento del mouse: si
+// la ventana no cubre todo, entonces "el mouse no esta confinado" significa que
+// nadie lo esta reteniendo, o sea que hay un menu abierto. Solo cuando la
+// ventana cubre el escritorio entero las dos cosas se vuelven indistinguibles.
+bool VentanaCubreTodoElEscritorio() {
+    HWND h = GetForegroundWindow();
+    if (!h) return false;
+
+    RECT rv;
+    if (!GetWindowRect(h, &rv)) return false;
+
+    RECT esc;
+    esc.left = GetSystemMetrics(SM_XVIRTUALSCREEN);
+    esc.top = GetSystemMetrics(SM_YVIRTUALSCREEN);
+    esc.right = esc.left + GetSystemMetrics(SM_CXVIRTUALSCREEN);
+    esc.bottom = esc.top + GetSystemMetrics(SM_CYVIRTUALSCREEN);
+
+    return rv.left <= esc.left && rv.top <= esc.top &&
+           rv.right >= esc.right && rv.bottom >= esc.bottom;
+}
+
 bool VentanaEnPantallaCompleta() {
     HWND h = GetForegroundWindow();
     if (!h) return false;
@@ -285,6 +307,126 @@ long DistanciaAlCentro() {
 //   - En un menú, apenas movés el mouse: nunca más pasa -> crece sin freno.
 // Se definen mas abajo, pero el muestreador las necesita.
 bool EstaJugando();
+bool ShiftApretado();
+
+// Snapshot de todas las señales, para el panel. Se guarda uno "viejo" (medio
+// segundo atrás) porque el panel solo se puede leer alt-tabeando, y Minecraft
+// restaura el cursor JUSTO al perder el foco: congelar el último valor medía el
+// instante en que la señal ya había cambiado, no lo que pasaba jugando.
+struct Muestra {
+    bool valida = false;
+    bool oculto = false, clip = false, warp = false, full = false, shift = false;
+    bool permite = false;
+    long dist = -1;
+    long long msCentro = -1;
+};
+Muestra g_muestraReciente, g_muestraVieja;
+
+// Se llama desde el timer de la ventana cada 15 ms.
+void MuestrearSeniales() {
+    // --- parámetros de la heurística del cursor secuestrado ---
+    const long TOLERANCIA_CENTRO = 10;   // qué tan cerca del centro cuenta como "volvió"
+    const long CORTE_INMEDIATO   = 200;  // tan lejos del centro que no puede estar jugando
+    const ULONGLONG VENTANA_APAGADO = 120;   // ms sin volver al centro -> menú
+    const ULONGLONG EXPIRA_SIN_MOVER = 2000; // ver comentario abajo
+
+    // Cuántas muestras seguidas hay que ver el cursor oculto antes de confiar en
+    // GetCursorInfo. Con una sola alcanzaría para que un instante raro desactive
+    // para siempre la heurística que sí funciona, así que se pide evidencia.
+    const long MUESTRAS_PARA_CONFIAR = 30;   // ~450 ms de juego
+
+    static long long ultimosMovimientos = 0;
+    static ULONGLONG ultimoPasoPorCentro = 0;
+    static ULONGLONG ultimoMovimiento = 0;
+    static ULONGLONG ultimaRotacion = 0;
+    static bool confirmado = false;
+
+    long long movs = g_movimientos.load();
+    bool huboMovimiento = (movs != ultimosMovimientos);
+    ultimosMovimientos = movs;
+
+    if (!VentanaActivaEsMinecraft()) return;   // fuera de Minecraft no tocamos nada
+
+    ULONGLONG ahora = GetTickCount64();
+    if (huboMovimiento) ultimoMovimiento = ahora;
+
+    // --- calibración de la señal de cursor oculto ---
+    bool oculto = CursorEstaOculto();
+    if (oculto) {
+        long n = g_muestrasOculto.load() + 1;
+        g_muestrasOculto = n;
+        if (n >= MUESTRAS_PARA_CONFIAR) g_senalCursorSirve = true;
+    }
+
+    // --- heurística del cursor secuestrado ---
+    long d = DistanciaAlCentro();
+    g_distCentro = d;
+
+    if (d >= 0 && d <= TOLERANCIA_CENTRO) {
+        ultimoPasoPorCentro = ahora;
+        // Que VUELVA al centro mientras movés la mano es la prueba de que algo lo
+        // está devolviendo ahí. Estar quieto en el centro no prueba nada: es
+        // exactamente lo que pasa también con el inventario recién abierto.
+        if (huboMovimiento) confirmado = true;
+    }
+    g_msDesdeCentro = ultimoPasoPorCentro ? (long long)(ahora - ultimoPasoPorCentro) : -1;
+
+    if (d > CORTE_INMEDIATO) confirmado = false;
+    if (!ultimoPasoPorCentro || (ahora - ultimoPasoPorCentro) > VENTANA_APAGADO) confirmado = false;
+
+    // Punto ciego irreducible de esta heurística: con el mouse totalmente quieto
+    // y el cursor en el centro, jugar y tener el inventario abierto son
+    // indistinguibles (el juego deja el cursor en el centro en los dos casos).
+    // Ante esa duda se elige NO clickear: un click de más en el inventario tira
+    // objetos, y para que vuelva a clickear alcanza con mover el mouse.
+    // Solo aplica a esta heurística; las otras dos capas no tienen este problema.
+    if (ultimoMovimiento && (ahora - ultimoMovimiento) > EXPIRA_SIN_MOVER) confirmado = false;
+
+    g_juegoWarpeaCursor = confirmado;
+
+    // --- snapshot para el panel ---
+    Muestra m;
+    m.valida = true;
+    m.oculto = oculto;
+    m.clip = RatonEstaConfinado();
+    m.warp = confirmado;
+    m.full = VentanaEnPantallaCompleta();
+    m.shift = ShiftApretado();
+    m.dist = d;
+    m.msCentro = g_msDesdeCentro.load();
+    m.permite = EstaJugando() || m.shift;
+    g_muestraReciente = m;
+
+    if (ahora - ultimaRotacion >= 500) {   // el panel muestra esto, medio segundo atrás
+        g_muestraVieja = g_muestraReciente;
+        ultimaRotacion = ahora;
+    }
+}
+
+// Las tres señales no son equivalentes: cada una es exacta en un contexto y
+// ciega en otro. En vez de mezclarlas con un OR (que deja que la peor de las
+// tres mantenga el click prendido), se usa la mejor disponible en cada caso.
+//
+//   1. Si en esta máquina GetCursorInfo demostró detectar que el juego oculta el
+//      puntero, esa es la respuesta exacta. Se calibra sola. (Con Minecraft no
+//      funciona, pero la capa queda por si sirve en otro juego o versión.)
+//   2. Mouse confinado a menos que el escritorio = algo lo está reteniendo, y
+//      eso solo pasa jugando. Es evidencia positiva y directa.
+//   3. Mouse NO confinado, pero la ventana tampoco cubre todo el escritorio:
+//      si estuvieras jugando, el juego lo estaría confinando. No lo hace ->
+//      hay un menú abierto. Exacto también.
+//      (Este es el caso de pantalla completa con varios monitores: la ventana
+//      ocupa un monitor, no el escritorio entero, así que sigue siendo exacto.)
+//   4. Recién si la ventana cubre TODO el escritorio, "no confinado" y
+//      "confinado a todo" son lo mismo y no se puede distinguir: ahí, y solo
+//      ahí, se cae a la heurística del cursor secuestrado, con su punto ciego.
+bool EstaJugando() {
+    if (g_senalCursorSirve.load()) return CursorEstaOculto();
+    if (RatonEstaConfinado()) return true;
+    if (!VentanaCubreTodoElEscritorio()) return false;
+    return g_juegoWarpeaCursor.load();
+}
+
 bool ShiftApretado();
 
 // Snapshot de todas las señales, para el panel. Se guarda uno "viejo" (medio
@@ -694,31 +836,31 @@ void ActualizarDiagnostico() {
     bool permite = mc && (jugando || shift);
 
     std::wstring capa;
-    if (g_senalCursorSirve.load())         capa = L"cursor oculto (exacta)";
-    else if (!VentanaEnPantallaCompleta()) capa = L"confinamiento (exacta)";
-    else                                   capa = L"warp (heuristica)";
+    if (g_senalCursorSirve.load())              capa = L"cursor oculto";
+    else if (!VentanaCubreTodoElEscritorio())   capa = L"confinamiento (exacta)";
+    else                                        capa = L"warp (heuristica)";
 
     std::wstring t;
     const Muestra& m = g_muestraVieja;
     if (!m.valida) {
         t = L"Con MC en foco: (todavia sin datos)\r\n\r\n";
     } else {
-        t =  L"MC en foco (0.5s atras): Oculto:"; t += m.oculto ? L"1" : L"0";
+        t =  L"MC 0.5s atras: Ocul:"; t += m.oculto ? L"1" : L"0";
         t += L" Clip:"; t += m.clip ? L"1" : L"0";
         t += L" Warp:"; t += m.warp ? L"1" : L"0";
         t += L" Full:"; t += m.full ? L"1" : L"0";
-        t += L" Shift:"; t += m.shift ? L"1" : L"0";
-        t += m.permite ? L"  -> CLICKEABA" : L"  -> bloqueado";
-        t += L"\r\ndistCentro:" + std::to_wstring(m.dist) + L"px";
-        t += L"  msDesdeCentro:" + std::to_wstring(m.msCentro);
-        t += L"  muestrasOculto:" + std::to_wstring(g_muestrasOculto.load());
+        t += L" Sh:"; t += m.shift ? L"1" : L"0";
+        t += m.permite ? L" -> CLICKEABA" : L" -> bloqueado";
+        t += L"\r\ndCtr:" + std::to_wstring(m.dist);
+        t += L" msCtr:" + std::to_wstring(m.msCentro);
+        t += L" mOcul:" + std::to_wstring(g_muestrasOculto.load());
         t += L"\r\n";
     }
 
-    t += L"Capa en uso: " + capa;
-    t += L"   |   Ahora: MC:";
+    t += L"Capa: " + capa;
+    t += L"  |  Ahora MC:";
     t += mc ? L"si" : L"no";
-    t += jugando ? L" Jugando:si" : L" Jugando:no";
+    t += jugando ? L" Jug:si" : L" Jug:no";
     t += permite ? L" -> CLICKEA" : L" -> bloqueado";
 
     SetTextoSiCambio(hLabelDeteccion, t);
@@ -758,10 +900,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             WS_CHILD | WS_VISIBLE | SS_CENTER, 10, 176, 444, 32, hwnd, NULL, NULL, NULL);
 
         hLabelDeteccion = CreateWindowExW(0, L"STATIC", L"",
-            WS_CHILD | WS_VISIBLE | SS_CENTER, 10, 214, 444, 50, hwnd, NULL, NULL, NULL);
+            WS_CHILD | WS_VISIBLE | SS_CENTER, 10, 214, 444, 72, hwnd, NULL, NULL, NULL);
 
         hLabelContador = CreateWindowExW(0, L"STATIC", L"Clicks generados: 0",
-            WS_CHILD | WS_VISIBLE | SS_CENTER, 10, 268, 444, 18, hwnd, NULL, NULL, NULL);
+            WS_CHILD | WS_VISIBLE | SS_CENTER, 10, 290, 444, 18, hwnd, NULL, NULL, NULL);
 
         ActualizarLabelHotkey();
 
@@ -837,7 +979,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
 
     hMain = CreateWindowExW(0, claseName, L"Autoclicker - C++",
         WS_OVERLAPPEDWINDOW & ~WS_MAXIMIZEBOX & ~WS_THICKFRAME,
-        CW_USEDEFAULT, CW_USEDEFAULT, 480, 345,
+        CW_USEDEFAULT, CW_USEDEFAULT, 480, 372,
         NULL, NULL, hInstance, NULL);
 
     ShowWindow(hMain, nCmdShow);
