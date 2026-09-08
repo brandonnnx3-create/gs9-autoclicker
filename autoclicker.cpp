@@ -23,6 +23,12 @@
 // Compilación: ver instrucciones que te paso aparte (Visual Studio recomendado).
 // ============================================================================
 
+// Windows Vista o superior: lo necesita PROCESS_QUERY_LIMITED_INFORMATION.
+// Visual Studio ya lo define asi por defecto, pero MinGW/g++ no siempre.
+#ifndef _WIN32_WINNT
+#define _WIN32_WINNT 0x0601
+#endif
+
 #include <windows.h>
 #include <windowsx.h>   // GET_X_LPARAM (maneja coordenadas negativas bien)
 #include <commctrl.h>
