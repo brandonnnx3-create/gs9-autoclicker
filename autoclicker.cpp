@@ -85,6 +85,8 @@ std::atomic<long long> g_movimientos{ 0 };      // movimientos REALES del mouse
 std::atomic<bool> g_juegoWarpeaCursor{ false }; // ver DetectarWarpDelCursor()
 std::atomic<long> g_distCentro{ -1 };           // px del cursor al centro (diagnostico)
 std::atomic<long long> g_msDesdeCentro{ -1 };   // ms desde el ultimo paso por el centro
+std::atomic<bool> g_senalCursorSirve{ false };  // GetCursorInfo demostro servir aca
+std::atomic<long> g_muestrasOculto{ 0 };        // cuantas veces vimos el cursor oculto
 
 const DWORD TECLA_EMERGENCIA = VK_F9;
 
@@ -222,6 +224,26 @@ bool RatonEstaConfinado() {
             clip.right < pantalla.right || clip.bottom < pantalla.bottom);
 }
 
+// ¿La ventana en foco ocupa todo su monitor? Importa porque decide cuál de las
+// señales es confiable: en modo ventana, el confinamiento del mouse distingue
+// perfecto entre jugar y estar en un menú; en pantalla completa no distingue
+// nada, porque el área confinada pasa a ser la pantalla entera.
+bool VentanaEnPantallaCompleta() {
+    HWND h = GetForegroundWindow();
+    if (!h) return false;
+
+    RECT rv;
+    if (!GetWindowRect(h, &rv)) return false;
+
+    HMONITOR mon = MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST);
+    MONITORINFO mi = { 0 };
+    mi.cbSize = sizeof(MONITORINFO);
+    if (!GetMonitorInfoW(mon, &mi)) return false;
+
+    return rv.left <= mi.rcMonitor.left && rv.top <= mi.rcMonitor.top &&
+           rv.right >= mi.rcMonitor.right && rv.bottom >= mi.rcMonitor.bottom;
+}
+
 // TERCERA SEÑAL (la única que sirve en pantalla completa con un solo monitor):
 // mientras jugás, Minecraft no deja que el cursor se mueva: lo vuelve a poner en
 // el centro del área de la ventana en cada cuadro. O sea, movés el mouse y la
@@ -261,58 +283,120 @@ long DistanciaAlCentro() {
 // Por eso se mide "cuánto hace que no pasa por el centro":
 //   - Jugando (te muevas o no): pasa por el centro cada cuadro -> siempre poco.
 //   - En un menú, apenas movés el mouse: nunca más pasa -> crece sin freno.
-void DetectarWarpDelCursor() {
-    // Cuanto cerca del centro cuenta como "paso por el centro". Amplio a
-    // proposito: mientras movés la mano, el cursor solo esta exactamente en el
-    // centro durante un instante despues de cada re-centrado, y muestrear justo
-    // ahi es dificil. Con 10 px la señal se atrapa mucho mas seguido sin volverse
-    // ambigua (10 px sigue siendo un blanco chiquito dentro de un menú).
-    const long TOLERANCIA_CENTRO = 10;
+// Se definen mas abajo, pero el muestreador las necesita.
+bool EstaJugando();
+bool ShiftApretado();
 
-    // Si el cursor esta MUY lejos del centro, no hay forma de que el juego lo
-    // este re-centrando: lo devolveria en el cuadro siguiente. Corte inmediato.
-    // Esto es lo que mata la demora cuando vas rapido a un objeto del inventario.
-    const long CORTE_INMEDIATO = 200;
+// Snapshot de todas las señales, para el panel. Se guarda uno "viejo" (medio
+// segundo atrás) porque el panel solo se puede leer alt-tabeando, y Minecraft
+// restaura el cursor JUSTO al perder el foco: congelar el último valor medía el
+// instante en que la señal ya había cambiado, no lo que pasaba jugando.
+struct Muestra {
+    bool valida = false;
+    bool oculto = false, clip = false, warp = false, full = false, shift = false;
+    bool permite = false;
+    long dist = -1;
+    long long msCentro = -1;
+};
+Muestra g_muestraReciente, g_muestraVieja;
 
-    // Corte normal, para movimientos cortos que no llegan a CORTE_INMEDIATO.
-    // Jugando, el cursor vuelve al centro cada cuadro (~16 ms), asi que 120 ms
-    // son ~7 oportunidades de atraparlo: de sobra.
-    const ULONGLONG VENTANA_APAGADO = 120;
+// Se llama desde el timer de la ventana cada 15 ms.
+void MuestrearSeniales() {
+    // --- parámetros de la heurística del cursor secuestrado ---
+    const long TOLERANCIA_CENTRO = 10;   // qué tan cerca del centro cuenta como "volvió"
+    const long CORTE_INMEDIATO   = 200;  // tan lejos del centro que no puede estar jugando
+    const ULONGLONG VENTANA_APAGADO = 120;   // ms sin volver al centro -> menú
+    const ULONGLONG EXPIRA_SIN_MOVER = 2000; // ver comentario abajo
+
+    // Cuántas muestras seguidas hay que ver el cursor oculto antes de confiar en
+    // GetCursorInfo. Con una sola alcanzaría para que un instante raro desactive
+    // para siempre la heurística que sí funciona, así que se pide evidencia.
+    const long MUESTRAS_PARA_CONFIAR = 30;   // ~450 ms de juego
 
     static long long ultimosMovimientos = 0;
     static ULONGLONG ultimoPasoPorCentro = 0;
+    static ULONGLONG ultimoMovimiento = 0;
+    static ULONGLONG ultimaRotacion = 0;
     static bool confirmado = false;
 
     long long movs = g_movimientos.load();
     bool huboMovimiento = (movs != ultimosMovimientos);
     ultimosMovimientos = movs;
 
-    if (!VentanaActivaEsMinecraft()) return;   // fuera de Minecraft no tocamos el estado
+    if (!VentanaActivaEsMinecraft()) return;   // fuera de Minecraft no tocamos nada
 
     ULONGLONG ahora = GetTickCount64();
+    if (huboMovimiento) ultimoMovimiento = ahora;
+
+    // --- calibración de la señal de cursor oculto ---
+    bool oculto = CursorEstaOculto();
+    if (oculto) {
+        long n = g_muestrasOculto.load() + 1;
+        g_muestrasOculto = n;
+        if (n >= MUESTRAS_PARA_CONFIAR) g_senalCursorSirve = true;
+    }
+
+    // --- heurística del cursor secuestrado ---
     long d = DistanciaAlCentro();
     g_distCentro = d;
 
     if (d >= 0 && d <= TOLERANCIA_CENTRO) {
         ultimoPasoPorCentro = ahora;
-        // Que vuelva al centro MIENTRAS movés la mano es la prueba de que algo lo
-        // esta devolviendo ahi. Eso es lo que confirma el secuestro del cursor.
+        // Que VUELVA al centro mientras movés la mano es la prueba de que algo lo
+        // está devolviendo ahí. Estar quieto en el centro no prueba nada: es
+        // exactamente lo que pasa también con el inventario recién abierto.
         if (huboMovimiento) confirmado = true;
     }
-
     g_msDesdeCentro = ultimoPasoPorCentro ? (long long)(ahora - ultimoPasoPorCentro) : -1;
 
     if (d > CORTE_INMEDIATO) confirmado = false;
     if (!ultimoPasoPorCentro || (ahora - ultimoPasoPorCentro) > VENTANA_APAGADO) confirmado = false;
 
+    // Punto ciego irreducible de esta heurística: con el mouse totalmente quieto
+    // y el cursor en el centro, jugar y tener el inventario abierto son
+    // indistinguibles (el juego deja el cursor en el centro en los dos casos).
+    // Ante esa duda se elige NO clickear: un click de más en el inventario tira
+    // objetos, y para que vuelva a clickear alcanza con mover el mouse.
+    // Solo aplica a esta heurística; las otras dos capas no tienen este problema.
+    if (ultimoMovimiento && (ahora - ultimoMovimiento) > EXPIRA_SIN_MOVER) confirmado = false;
+
     g_juegoWarpeaCursor = confirmado;
+
+    // --- snapshot para el panel ---
+    Muestra m;
+    m.valida = true;
+    m.oculto = oculto;
+    m.clip = RatonEstaConfinado();
+    m.warp = confirmado;
+    m.full = VentanaEnPantallaCompleta();
+    m.shift = ShiftApretado();
+    m.dist = d;
+    m.msCentro = g_msDesdeCentro.load();
+    m.permite = EstaJugando() || m.shift;
+    g_muestraReciente = m;
+
+    if (ahora - ultimaRotacion >= 500) {   // el panel muestra esto, medio segundo atrás
+        g_muestraVieja = g_muestraReciente;
+        ultimaRotacion = ahora;
+    }
 }
 
-// "Estás jugando" si CUALQUIERA de las tres señales lo indica. Ninguna da true
-// en un menú, así que sumarlas no arruina el caso del inventario: solo agrega
-// cobertura donde las otras fallan.
+// Las tres señales no son equivalentes: cada una es exacta en un contexto y
+// ciega en otro. En vez de mezclarlas con un OR (que deja que la peor de las
+// tres mantenga el click prendido), se usa la mejor disponible en cada caso.
+//
+//   1. Si en esta máquina GetCursorInfo demostró detectar que el juego oculta el
+//      puntero, esa es la respuesta exacta: cursor visible = menú, punto. No
+//      tiene demora ni ambigüedad. Se calibra sola (ver MuestrearSeniales).
+//   2. Si no, y la ventana NO está en pantalla completa, el confinamiento del
+//      mouse es exacto: jugando confina, cualquier menú libera.
+//   3. Si no queda otra (pantalla completa sin señal de cursor), la heurística
+//      del cursor secuestrado. Es la única que sirve ahí, pero es la que tiene
+//      el punto ciego del mouse totalmente quieto (ver MuestrearSeniales).
 bool EstaJugando() {
-    return CursorEstaOculto() || RatonEstaConfinado() || g_juegoWarpeaCursor.load();
+    if (g_senalCursorSirve.load()) return CursorEstaOculto();
+    if (!VentanaEnPantallaCompleta()) return RatonEstaConfinado();
+    return g_juegoWarpeaCursor.load();
 }
 
 bool ShiftApretado() {
@@ -606,52 +690,36 @@ LRESULT CALLBACK SliderSubclassProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
 void ActualizarDiagnostico() {
     bool mc = VentanaActivaEsMinecraft();
     bool shift = ShiftApretado();
-
-    CURSORINFO ci = { 0 };
-    ci.cbSize = sizeof(CURSORINFO);
-    bool okInfo = GetCursorInfo(&ci) != FALSE;
-    bool showing = okInfo && (ci.flags & CURSOR_SHOWING) != 0;
-    bool hayHandle = okInfo && ci.hCursor != NULL;
-    bool clip = RatonEstaConfinado();
-    bool warp = g_juegoWarpeaCursor.load();
     bool jugando = EstaJugando();
     bool permite = mc && (jugando || shift);
 
-    // Con Minecraft en foco guardamos lo que vimos. Asi, cuando salgas del juego
-    // para leer esto (en pantalla completa no te queda otra), las dos primeras
-    // lineas siguen mostrando lo que pasaba MIENTRAS jugabas, no lo de ahora.
-    static bool hayCongelado = false;
-    static bool cShow = false, cHCur = false, cClip = false, cWarp = false;
-    static bool cShift = false, cPermite = false;
-    static long cDist = -1;
-    static long long cMs = -1;
-    if (mc) {
-        hayCongelado = true;
-        cShow = showing; cHCur = hayHandle; cClip = clip; cWarp = warp;
-        cShift = shift;  cPermite = permite;
-        cDist = g_distCentro.load();
-        cMs = g_msDesdeCentro.load();
-    }
+    std::wstring capa;
+    if (g_senalCursorSirve.load())         capa = L"cursor oculto (exacta)";
+    else if (!VentanaEnPantallaCompleta()) capa = L"confinamiento (exacta)";
+    else                                   capa = L"warp (heuristica)";
 
     std::wstring t;
-    if (!hayCongelado) {
-        t = L"Con MC en foco: (todavia sin datos)\r\n";
+    const Muestra& m = g_muestraVieja;
+    if (!m.valida) {
+        t = L"Con MC en foco: (todavia sin datos)\r\n\r\n";
     } else {
-        t =  L"Con MC en foco: Show:"; t += cShow ? L"1" : L"0";
-        t += L" hCur:"; t += cHCur ? L"1" : L"0";
-        t += L" Clip:"; t += cClip ? L"1" : L"0";
-        t += L" Warp:"; t += cWarp ? L"1" : L"0";
-        t += L" Shift:"; t += cShift ? L"1" : L"0";
-        t += L"\r\ndistCentro:" + std::to_wstring(cDist) + L"px";
-        t += L"  msDesdeCentro:" + std::to_wstring(cMs);
-        t += cPermite ? L"  -> CLICKEABA" : L"  -> bloqueado";
+        t =  L"MC en foco (0.5s atras): Oculto:"; t += m.oculto ? L"1" : L"0";
+        t += L" Clip:"; t += m.clip ? L"1" : L"0";
+        t += L" Warp:"; t += m.warp ? L"1" : L"0";
+        t += L" Full:"; t += m.full ? L"1" : L"0";
+        t += L" Shift:"; t += m.shift ? L"1" : L"0";
+        t += m.permite ? L"  -> CLICKEABA" : L"  -> bloqueado";
+        t += L"\r\ndistCentro:" + std::to_wstring(m.dist) + L"px";
+        t += L"  msDesdeCentro:" + std::to_wstring(m.msCentro);
+        t += L"  muestrasOculto:" + std::to_wstring(g_muestrasOculto.load());
         t += L"\r\n";
     }
 
-    t += L"Ahora: MC:";
+    t += L"Capa en uso: " + capa;
+    t += L"   |   Ahora: MC:";
     t += mc ? L"si" : L"no";
-    t += jugando ? L"  Jugando:si" : L"  Jugando:no";
-    t += permite ? L"  -> CLICKEA" : L"  -> bloqueado";
+    t += jugando ? L" Jugando:si" : L" Jugando:no";
+    t += permite ? L" -> CLICKEA" : L" -> bloqueado";
 
     SetTextoSiCambio(hLabelDeteccion, t);
     SetTextoSiCambio(hLabelContador, L"Clicks generados: " + std::to_wstring(g_contador.load()));
@@ -662,22 +730,22 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
     case WM_CREATE: {
         hLabelEstado = CreateWindowExW(0, L"STATIC", L"Estado: PAUSADO",
-            WS_CHILD | WS_VISIBLE | SS_CENTER, 10, 10, 384, 20, hwnd, NULL, NULL, NULL);
+            WS_CHILD | WS_VISIBLE | SS_CENTER, 10, 10, 444, 20, hwnd, NULL, NULL, NULL);
 
         hLabelHotkey = CreateWindowExW(0, L"STATIC", L"",
-            WS_CHILD | WS_VISIBLE | SS_CENTER, 10, 35, 384, 20, hwnd, NULL, NULL, NULL);
+            WS_CHILD | WS_VISIBLE | SS_CENTER, 10, 35, 444, 20, hwnd, NULL, NULL, NULL);
 
         hLabelEmergencia = CreateWindowExW(0, L"STATIC", L"Emergencia (siempre desarma): F9",
-            WS_CHILD | WS_VISIBLE | SS_CENTER, 10, 58, 384, 18, hwnd, NULL, NULL, NULL);
+            WS_CHILD | WS_VISIBLE | SS_CENTER, 10, 58, 444, 18, hwnd, NULL, NULL, NULL);
 
         hBtnHotkey = CreateWindowExW(0, L"BUTTON", L"Cambiar tecla",
-            WS_CHILD | WS_VISIBLE, 152, 82, 100, 26, hwnd, (HMENU)IDC_BTN_HOTKEY, NULL, NULL);
+            WS_CHILD | WS_VISIBLE, 182, 82, 100, 26, hwnd, (HMENU)IDC_BTN_HOTKEY, NULL, NULL);
 
         hLabelCps = CreateWindowExW(0, L"STATIC", L"CPS: 10.000",
-            WS_CHILD | WS_VISIBLE | SS_CENTER, 10, 118, 384, 20, hwnd, NULL, NULL, NULL);
+            WS_CHILD | WS_VISIBLE | SS_CENTER, 10, 118, 444, 20, hwnd, NULL, NULL, NULL);
 
         hSliderCps = CreateWindowExW(0, TRACKBAR_CLASSW, L"",
-            WS_CHILD | WS_VISIBLE | TBS_HORZ, 10, 142, 384, 30, hwnd, (HMENU)IDC_SLIDER_CPS, NULL, NULL);
+            WS_CHILD | WS_VISIBLE | TBS_HORZ, 10, 142, 444, 30, hwnd, (HMENU)IDC_SLIDER_CPS, NULL, NULL);
         SendMessageW(hSliderCps, TBM_SETRANGE, TRUE, MAKELPARAM(1, 50000));
         SendMessageW(hSliderCps, TBM_SETPOS, TRUE, 10000);
 
@@ -687,13 +755,13 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         hLabelAyuda = CreateWindowExW(0, L"STATIC",
             L"Shift + click en el slider = escribir el n\u00famero a mano.\r\n"
             L"En inventario/men\u00fa no clickea, salvo que mantengas SHIFT.",
-            WS_CHILD | WS_VISIBLE | SS_CENTER, 10, 176, 384, 32, hwnd, NULL, NULL, NULL);
+            WS_CHILD | WS_VISIBLE | SS_CENTER, 10, 176, 444, 32, hwnd, NULL, NULL, NULL);
 
         hLabelDeteccion = CreateWindowExW(0, L"STATIC", L"",
-            WS_CHILD | WS_VISIBLE | SS_CENTER, 10, 214, 384, 50, hwnd, NULL, NULL, NULL);
+            WS_CHILD | WS_VISIBLE | SS_CENTER, 10, 214, 444, 50, hwnd, NULL, NULL, NULL);
 
         hLabelContador = CreateWindowExW(0, L"STATIC", L"Clicks generados: 0",
-            WS_CHILD | WS_VISIBLE | SS_CENTER, 10, 268, 384, 18, hwnd, NULL, NULL, NULL);
+            WS_CHILD | WS_VISIBLE | SS_CENTER, 10, 268, 444, 18, hwnd, NULL, NULL, NULL);
 
         ActualizarLabelHotkey();
 
@@ -715,7 +783,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             // El muestreo tiene que ser rapido: el juego devuelve el cursor al
             // centro una vez por cuadro (~16 ms), asi que a 100 ms nos perdiamos
             // casi todos esos regresos mientras el mouse estaba en movimiento.
-            DetectarWarpDelCursor();
+            MuestrearSeniales();
             static int tick = 0;
             if (++tick >= 7) { tick = 0; ActualizarDiagnostico(); }
         }
@@ -769,7 +837,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
 
     hMain = CreateWindowExW(0, claseName, L"Autoclicker - C++",
         WS_OVERLAPPEDWINDOW & ~WS_MAXIMIZEBOX & ~WS_THICKFRAME,
-        CW_USEDEFAULT, CW_USEDEFAULT, 420, 345,
+        CW_USEDEFAULT, CW_USEDEFAULT, 480, 345,
         NULL, NULL, hInstance, NULL);
 
     ShowWindow(hMain, nCmdShow);
