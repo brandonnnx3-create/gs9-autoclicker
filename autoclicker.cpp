@@ -262,6 +262,23 @@ long DistanciaAlCentro() {
 //   - Jugando (te muevas o no): pasa por el centro cada cuadro -> siempre poco.
 //   - En un menú, apenas movés el mouse: nunca más pasa -> crece sin freno.
 void DetectarWarpDelCursor() {
+    // Cuanto cerca del centro cuenta como "paso por el centro". Amplio a
+    // proposito: mientras movés la mano, el cursor solo esta exactamente en el
+    // centro durante un instante despues de cada re-centrado, y muestrear justo
+    // ahi es dificil. Con 10 px la señal se atrapa mucho mas seguido sin volverse
+    // ambigua (10 px sigue siendo un blanco chiquito dentro de un menú).
+    const long TOLERANCIA_CENTRO = 10;
+
+    // Si el cursor esta MUY lejos del centro, no hay forma de que el juego lo
+    // este re-centrando: lo devolveria en el cuadro siguiente. Corte inmediato.
+    // Esto es lo que mata la demora cuando vas rapido a un objeto del inventario.
+    const long CORTE_INMEDIATO = 200;
+
+    // Corte normal, para movimientos cortos que no llegan a CORTE_INMEDIATO.
+    // Jugando, el cursor vuelve al centro cada cuadro (~16 ms), asi que 120 ms
+    // son ~7 oportunidades de atraparlo: de sobra.
+    const ULONGLONG VENTANA_APAGADO = 120;
+
     static long long ultimosMovimientos = 0;
     static ULONGLONG ultimoPasoPorCentro = 0;
     static bool confirmado = false;
@@ -276,19 +293,17 @@ void DetectarWarpDelCursor() {
     long d = DistanciaAlCentro();
     g_distCentro = d;
 
-    if (d >= 0 && d <= 3) {
+    if (d >= 0 && d <= TOLERANCIA_CENTRO) {
         ultimoPasoPorCentro = ahora;
-        // Que el cursor pase por el centro MIENTRAS movés la mano es la prueba
-        // de que algo lo está devolviendo ahí. Eso es lo que confirma el warp.
+        // Que vuelva al centro MIENTRAS movés la mano es la prueba de que algo lo
+        // esta devolviendo ahi. Eso es lo que confirma el secuestro del cursor.
         if (huboMovimiento) confirmado = true;
     }
 
     g_msDesdeCentro = ultimoPasoPorCentro ? (long long)(ahora - ultimoPasoPorCentro) : -1;
 
-    // Se apaga recién cuando hace un rato largo que no vuelve al centro, no ante
-    // una sola muestra descentrada (esa era la falla anterior: se apagaba justo
-    // mientras movías, que es cuando más descentrado lo agarrás).
-    if (!ultimoPasoPorCentro || (ahora - ultimoPasoPorCentro) > 250) confirmado = false;
+    if (d > CORTE_INMEDIATO) confirmado = false;
+    if (!ultimoPasoPorCentro || (ahora - ultimoPasoPorCentro) > VENTANA_APAGADO) confirmado = false;
 
     g_juegoWarpeaCursor = confirmado;
 }
@@ -348,10 +363,11 @@ void HiloClicks() {
         }
 
         if (ahora < proximoClick) {
-            // Esperamos de a 50ms como mucho, para reaccionar rápido si soltás
-            // el botón o movés el slider en el medio.
+            // Esperamos de a 15ms como mucho, para reaccionar rápido si soltás el
+            // botón, movés el slider, o se abre un menú: la condición se vuelve a
+            // evaluar recién al despertarse, así que este tope es demora directa.
             auto falta = proximoClick - ahora;
-            auto tope = std::chrono::milliseconds(50);
+            auto tope = std::chrono::milliseconds(15);
             DormirInterrumpible(falta < tope ? falta : std::chrono::duration_cast<reloj::duration>(tope));
             continue;
         }
