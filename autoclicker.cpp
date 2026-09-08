@@ -87,6 +87,7 @@ std::atomic<long> g_distCentro{ -1 };           // px del cursor al centro (diag
 std::atomic<long long> g_msDesdeCentro{ -1 };   // ms desde el ultimo paso por el centro
 std::atomic<bool> g_senalCursorSirve{ false };  // GetCursorInfo demostro servir aca
 std::atomic<long> g_muestrasOculto{ 0 };        // cuantas veces vimos el cursor oculto
+std::atomic<bool> g_pedidoApagarWarp{ false };  // E/Escape: apagar la heuristica ya
 
 const DWORD TECLA_EMERGENCIA = VK_F9;
 
@@ -319,6 +320,7 @@ struct Muestra {
     bool permite = false;
     long dist = -1;
     long long msCentro = -1;
+    int capa = 0;   // 1=cursor oculto  2=confinamiento  3=warp
 };
 Muestra g_muestraReciente, g_muestraVieja;
 
@@ -371,6 +373,11 @@ void MuestrearSeniales() {
     }
     g_msDesdeCentro = ultimoPasoPorCentro ? (long long)(ahora - ultimoPasoPorCentro) : -1;
 
+    // Se abrio un menu con el teclado: cortar ya, sin esperar a la heuristica.
+    // Esto es lo que arregla el menu de pausa, donde el cursor queda en el
+    // centro (sobre los botones) y sin movimiento no hay nada que observar.
+    if (g_pedidoApagarWarp.exchange(false)) confirmado = false;
+
     if (d > CORTE_INMEDIATO) confirmado = false;
     if (!ultimoPasoPorCentro || (ahora - ultimoPasoPorCentro) > VENTANA_APAGADO) confirmado = false;
 
@@ -394,6 +401,7 @@ void MuestrearSeniales() {
     m.shift = ShiftApretado();
     m.dist = d;
     m.msCentro = g_msDesdeCentro.load();
+    m.capa = g_senalCursorSirve.load() ? 1 : (!VentanaCubreTodoElEscritorio() ? 2 : 3);
     m.permite = EstaJugando() || m.shift;
     g_muestraReciente = m;
 
@@ -530,6 +538,13 @@ LRESULT CALLBACK KeyboardHookProc(int nCode, WPARAM wParam, LPARAM lParam) {
             ActualizarLabelHotkey();
             return CallNextHookEx(NULL, nCode, wParam, lParam);
         }
+
+        // E y Escape abren menus. Se usan SOLO para APAGAR la heuristica del
+        // cursor secuestrado, nunca para encenderla: mirar el teclado no sirve
+        // para saber cuando volves a jugar (podes cerrar el menu clickeando
+        // "Back to Game"), pero para saber que se ABRIO un menu es inmediato y
+        // no tiene falsos negativos. Volver a jugar lo detecta el cursor.
+        if (vk == VK_ESCAPE || vk == 'E') g_pedidoApagarWarp = true;
 
         if (vk == g_hotkeyVK.load()) {
             static ULONGLONG ultimoToggle = 0;
@@ -721,10 +736,14 @@ void ActualizarDiagnostico() {
     bool jugando = EstaJugando();
     bool permite = mc && (jugando || shift);
 
-    std::wstring capa;
-    if (g_senalCursorSirve.load())              capa = L"cursor oculto";
-    else if (!VentanaCubreTodoElEscritorio())   capa = L"confinamiento (exacta)";
-    else                                        capa = L"warp (heuristica)";
+    // OJO: la capa se lee del snapshot, no se recalcula. Calcularla en vivo la
+    // evalua contra la ventana en foco de ESTE instante, que al alt-tabear para
+    // leer el panel ya no es Minecraft: mostraba una capa que no era la que se
+    // habia usado jugando.
+    std::wstring capa = L"(sin datos)";
+    if (g_muestraVieja.capa == 1) capa = L"cursor oculto (exacta)";
+    else if (g_muestraVieja.capa == 2) capa = L"confinamiento (exacta)";
+    else if (g_muestraVieja.capa == 3) capa = L"warp (heuristica)";
 
     std::wstring t;
     const Muestra& m = g_muestraVieja;
@@ -743,8 +762,8 @@ void ActualizarDiagnostico() {
         t += L"\r\n";
     }
 
-    t += L"Capa: " + capa;
-    t += L"  |  Ahora MC:";
+    t = L"CAPA: " + capa + L"\r\n" + t;
+    t += L"Ahora MC:";
     t += mc ? L"si" : L"no";
     t += jugando ? L" Jug:si" : L" Jug:no";
     t += permite ? L" -> CLICKEA" : L" -> bloqueado";
