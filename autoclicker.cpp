@@ -87,7 +87,7 @@ std::atomic<long> g_distCentro{ -1 };           // px del cursor al centro (diag
 std::atomic<long long> g_msDesdeCentro{ -1 };   // ms desde el ultimo paso por el centro
 std::atomic<bool> g_senalCursorSirve{ false };  // GetCursorInfo demostro servir aca
 std::atomic<long> g_muestrasOculto{ 0 };        // cuantas veces vimos el cursor oculto
-std::atomic<bool> g_pedidoApagarWarp{ false };  // E/Escape: apagar la heuristica ya
+std::atomic<int> g_alternanciasMenu{ 0 };       // E/Escape: entrar o salir de un menu
 std::atomic<long> g_retornos{ 0 };              // vueltas al pixel exacto (diagnostico)
 
 const DWORD TECLA_EMERGENCIA = VK_F9;
@@ -376,12 +376,20 @@ void MuestrearSeniales() {
     // SE ABRIO UN MENU
     // ------------------------------------------------------------------
 
-    // Teclado: E y Escape. Inmediato. Se usan SOLO para apagar, nunca para
-    // encender: mirar el teclado no sirve para saber cuándo volvés a jugar,
-    // porque un menú se puede cerrar clickeando "Back to Game".
-    if (g_pedidoApagarWarp.exchange(false)) {
-        menuAbierto = true;
+    // Teclado: E y Escape ALTERNAN entre juego y menú, y son inmediatos en las
+    // dos direcciones. Abrir el inventario corta el click al instante; cerrarlo
+    // lo reanuda al instante, sin tener que mover el mouse.
+    //
+    // El teclado por sí solo no alcanza (podés cerrar el menú clickeando "Back
+    // to Game", y ahí la alternancia queda desfasada), por eso siguen estando
+    // las dos correcciones por cursor de más abajo. Pero como el 95% de las
+    // veces salís del menú con la misma tecla, esto cubre el caso normal sin
+    // esperar nada.
+    int alternancias = g_alternanciasMenu.exchange(0);
+    if (alternancias % 2) {
+        menuAbierto = !menuAbierto;
         for (int i = 0; i < RETORNOS_PARA_VOLVER; i++) retornos[i] = 0;
+        desdeCuandoLejos = 0;
     }
 
     // El cursor se quedó lejos del centro un rato. OJO: lo que importa es que se
@@ -553,6 +561,13 @@ LRESULT CALLBACK MouseHookProc(int nCode, WPARAM wParam, LPARAM lParam) {
 
 // ---------------- HOOK DE TECLADO ----------------
 LRESULT CALLBACK KeyboardHookProc(int nCode, WPARAM wParam, LPARAM lParam) {
+    static bool teclaMenuAbajo = false;   // E o Escape mantenida: evita el auto-repeat
+
+    if (nCode == HC_ACTION && (wParam == WM_KEYUP || wParam == WM_SYSKEYUP)) {
+        KBDLLHOOKSTRUCT* info = (KBDLLHOOKSTRUCT*)lParam;
+        if (info->vkCode == VK_ESCAPE || info->vkCode == 'E') teclaMenuAbajo = false;
+    }
+
     if (nCode == HC_ACTION && (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN)) {
         KBDLLHOOKSTRUCT* info = (KBDLLHOOKSTRUCT*)lParam;
         DWORD vk = info->vkCode;
@@ -570,12 +585,19 @@ LRESULT CALLBACK KeyboardHookProc(int nCode, WPARAM wParam, LPARAM lParam) {
             return CallNextHookEx(NULL, nCode, wParam, lParam);
         }
 
-        // E y Escape abren menus. Se usan SOLO para APAGAR la heuristica del
-        // cursor secuestrado, nunca para encenderla: mirar el teclado no sirve
-        // para saber cuando volves a jugar (podes cerrar el menu clickeando
-        // "Back to Game"), pero para saber que se ABRIO un menu es inmediato y
-        // no tiene falsos negativos. Volver a jugar lo detecta el cursor.
-        if (vk == VK_ESCAPE || vk == 'E') g_pedidoApagarWarp = true;
+        // E y Escape no ABREN menus: los ALTERNAN. E cierra el inventario igual
+        // que lo abre, y Escape cierra el menu de pausa. Tratarlos como "se
+        // abrio un menu" dejaba el click apagado justo al volver al juego, y
+        // obligaba a mover el mouse para que reviviera.
+        //
+        // Windows repite el evento de tecla apretada mientras la mantenes, asi
+        // que se alterna solo en la primera pulsacion (ver el WM_KEYUP abajo).
+        if (vk == VK_ESCAPE || vk == 'E') {
+            if (!teclaMenuAbajo) {
+                teclaMenuAbajo = true;
+                g_alternanciasMenu = g_alternanciasMenu.load() + 1;
+            }
+        }
 
         if (vk == g_hotkeyVK.load()) {
             static ULONGLONG ultimoToggle = 0;
