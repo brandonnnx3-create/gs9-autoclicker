@@ -23,6 +23,17 @@
 // Compilación: ver instrucciones que te paso aparte (Visual Studio recomendado).
 // ============================================================================
 
+// Los proyectos de Visual Studio definen UNICODE por defecto, pero compilar con
+// "cl" a secas no. Sin esto, macros como IDC_ARROW se expanden a la version ANSI
+// y no compilan contra LoadCursorW. Definirlo aca hace que el archivo compile
+// igual desde el IDE que desde la linea de comandos.
+#ifndef UNICODE
+#define UNICODE
+#endif
+#ifndef _UNICODE
+#define _UNICODE
+#endif
+
 // Windows Vista o superior: lo necesita PROCESS_QUERY_LIMITED_INFORMATION.
 // Visual Studio ya lo define asi por defecto, pero MinGW/g++ no siempre.
 #ifndef _WIN32_WINNT
@@ -139,7 +150,7 @@ bool VentanaActivaEsMinecraft() {
     HWND hFront = GetForegroundWindow();
     if (!hFront) return false;
 
-    static std::atomic<HWND> ultimaVentana{ NULL };
+    static std::atomic<HWND> ultimaVentana{ nullptr };
     static std::atomic<bool> ultimoResultado{ false };
     if (hFront == ultimaVentana.load()) return ultimoResultado.load();
 
