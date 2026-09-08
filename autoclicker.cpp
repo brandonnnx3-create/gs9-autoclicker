@@ -80,6 +80,8 @@ std::atomic<bool> g_esperandoNuevaTecla{ false };
 std::atomic<double> g_cps{ 10.0 };
 std::atomic<DWORD> g_hotkeyVK{ VK_F6 };
 std::atomic<long long> g_contador{ 0 };
+std::atomic<long long> g_movimientos{ 0 };      // movimientos REALES del mouse
+std::atomic<bool> g_juegoWarpeaCursor{ false }; // ver DetectarWarpDelCursor()
 
 const DWORD TECLA_EMERGENCIA = VK_F9;
 
@@ -217,11 +219,65 @@ bool RatonEstaConfinado() {
             clip.right < pantalla.right || clip.bottom < pantalla.bottom);
 }
 
-// "Estás jugando" = el cursor desapareció de la pantalla.
-// El OR con el confinamiento solo puede AGREGAR detección de "jugando"; en un
-// menú ninguna de las dos da true, así que no arruina el caso del inventario.
+// TERCERA SEÑAL (la única que sirve en pantalla completa con un solo monitor):
+// mientras jugás, Minecraft no deja que el cursor se mueva: lo vuelve a poner en
+// el centro del área de la ventana en cada cuadro. O sea, movés el mouse y la
+// posición del cursor NO cambia. En un menú eso es imposible: el cursor se mueve
+// libremente con la mano.
+//
+// Esto no depende ni de que el cursor esté oculto ni de que el mouse esté
+// confinado, así que sobrevive a la pantalla completa.
+bool CursorEnCentroDeLaVentana() {
+    HWND h = GetForegroundWindow();
+    if (!h) return false;
+
+    RECT rc;
+    if (!GetClientRect(h, &rc)) return false;
+    POINT centro = { (rc.right - rc.left) / 2, (rc.bottom - rc.top) / 2 };
+    if (!ClientToScreen(h, &centro)) return false;
+
+    POINT p;
+    if (!GetCursorPos(&p)) return false;
+
+    long dx = p.x - centro.x;
+    long dy = p.y - centro.y;
+    return (dx * dx + dy * dy) <= 16;   // 4 px de tolerancia
+}
+
+// Se llama desde el timer de la ventana (cada 100 ms) y mantiene un estado
+// "el juego está secuestrando el cursor", que es el que después se consulta.
+//
+// Por qué un estado y no una consulta directa: si estuvieras jugando pero sin
+// mover el mouse, no habría nada que observar. Entonces la conclusión se
+// LATCHEA: se prende cuando vemos movimiento real con el cursor clavado en el
+// centro, y se apaga apenas el cursor aparece en cualquier otro lado (que es lo
+// que pasa apenas abrís un menú y movés la mano).
+//
+// Se exige el centro en DOS muestras seguidas para que un cursor que apenas pasa
+// por el centro dentro de un menú no lo prenda por error.
+void DetectarWarpDelCursor() {
+    static long long ultimosMovimientos = 0;
+    static bool centradoAnterior = false;
+
+    long long movs = g_movimientos.load();
+    bool huboMovimiento = (movs != ultimosMovimientos);
+    ultimosMovimientos = movs;
+
+    if (!VentanaActivaEsMinecraft()) return;   // fuera de Minecraft no tocamos el estado
+
+    bool centrado = CursorEnCentroDeLaVentana();
+    if (centrado && centradoAnterior && huboMovimiento)
+        g_juegoWarpeaCursor = true;    // movés el mouse y no se mueve -> te lo secuestró
+    else if (!centrado)
+        g_juegoWarpeaCursor = false;   // el cursor anda suelto -> estás en un menú
+    centradoAnterior = centrado;
+}
+
+// "Estás jugando" si CUALQUIERA de las tres señales lo indica. Ninguna da true
+// en un menú, así que sumarlas no arruina el caso del inventario: solo agrega
+// cobertura donde las otras fallan.
 bool EstaJugando() {
-    return CursorEstaOculto() || RatonEstaConfinado();
+    return CursorEstaOculto() || RatonEstaConfinado() || g_juegoWarpeaCursor.load();
 }
 
 bool ShiftApretado() {
@@ -295,11 +351,14 @@ void HiloClicks() {
 // ---------------- HOOK DE MOUSE ----------------
 LRESULT CALLBACK MouseHookProc(int nCode, WPARAM wParam, LPARAM lParam) {
     if (nCode == HC_ACTION) {
+        MSLLHOOKSTRUCT* info = (MSLLHOOKSTRUCT*)lParam;
         if (wParam == WM_LBUTTONDOWN || wParam == WM_LBUTTONUP) {
-            MSLLHOOKSTRUCT* info = (MSLLHOOKSTRUCT*)lParam;
             if (!(info->flags & LLMHF_INJECTED)) {
                 g_mouseApretado = (wParam == WM_LBUTTONDOWN);
             }
+        } else if (wParam == WM_MOUSEMOVE) {
+            // Solo movimientos de la mano, no los que genere este programa.
+            if (!(info->flags & LLMHF_INJECTED)) g_movimientos++;
         }
     }
     return CallNextHookEx(NULL, nCode, wParam, lParam);
@@ -510,30 +569,49 @@ LRESULT CALLBACK SliderSubclassProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
 // completa, que es donde la señal vieja fallaba).
 void ActualizarDiagnostico() {
     bool mc = VentanaActivaEsMinecraft();
-    bool jugando = EstaJugando();
     bool shift = ShiftApretado();
-    bool permite = mc && (jugando || shift);
 
     CURSORINFO ci = { 0 };
     ci.cbSize = sizeof(CURSORINFO);
     bool okInfo = GetCursorInfo(&ci) != FALSE;
     bool showing = okInfo && (ci.flags & CURSOR_SHOWING) != 0;
     bool hayHandle = okInfo && ci.hCursor != NULL;
+    bool clip = RatonEstaConfinado();
+    bool warp = g_juegoWarpeaCursor.load();
+    bool jugando = EstaJugando();
+    bool permite = mc && (jugando || shift);
 
-    std::wstring t = L"Show:";
-    t += showing ? L"1" : L"0";
-    t += L"  hCur:";
-    t += hayHandle ? L"1" : L"0";
-    t += L"  Clip:";
-    t += RatonEstaConfinado() ? L"1" : L"0";
-    t += L"  Shift:";
-    t += shift ? L"1" : L"0";
-    t += L"\r\nMinecraft:";
+    // Con Minecraft en foco guardamos lo que vimos. Asi, cuando salgas del juego
+    // para leer esto (en pantalla completa no te queda otra), la primera linea
+    // sigue mostrando lo que pasaba MIENTRAS jugabas, no lo de ahora.
+    static bool hayCongelado = false;
+    static bool cShow = false, cHCur = false, cClip = false, cWarp = false;
+    static bool cShift = false, cPermite = false;
+    if (mc) {
+        hayCongelado = true;
+        cShow = showing; cHCur = hayHandle; cClip = clip; cWarp = warp;
+        cShift = shift;  cPermite = permite;
+    }
+
+    std::wstring t = L"Con MC en foco: ";
+    if (!hayCongelado) {
+        t += L"(todavia sin datos)";
+    } else {
+        t += L"Show:";  t += cShow    ? L"1" : L"0";
+        t += L" hCur:"; t += cHCur    ? L"1" : L"0";
+        t += L" Clip:"; t += cClip    ? L"1" : L"0";
+        t += L" Warp:"; t += cWarp    ? L"1" : L"0";
+        t += L" Shift:";t += cShift   ? L"1" : L"0";
+        t += cPermite ? L"  -> CLICKEABA" : L"  -> bloqueado";
+    }
+
+    t += L"\r\nAhora: MC:";
     t += mc ? L"si" : L"no";
-    t += jugando ? L"  Cursor:OCULTO" : L"  Cursor:VISIBLE";
+    t += jugando ? L"  Jugando:si" : L"  Jugando:no";
+    t += shift ? L"  Shift:1" : L"  Shift:0";
     t += permite ? L"  -> CLICKEA" : L"  -> bloqueado";
-    SetTextoSiCambio(hLabelDeteccion, t);
 
+    SetTextoSiCambio(hLabelDeteccion, t);
     SetTextoSiCambio(hLabelContador, L"Clicks generados: " + std::to_wstring(g_contador.load()));
 }
 
@@ -542,22 +620,22 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
     case WM_CREATE: {
         hLabelEstado = CreateWindowExW(0, L"STATIC", L"Estado: PAUSADO",
-            WS_CHILD | WS_VISIBLE | SS_CENTER, 10, 10, 260, 20, hwnd, NULL, NULL, NULL);
+            WS_CHILD | WS_VISIBLE | SS_CENTER, 10, 10, 344, 20, hwnd, NULL, NULL, NULL);
 
         hLabelHotkey = CreateWindowExW(0, L"STATIC", L"",
-            WS_CHILD | WS_VISIBLE | SS_CENTER, 10, 35, 260, 20, hwnd, NULL, NULL, NULL);
+            WS_CHILD | WS_VISIBLE | SS_CENTER, 10, 35, 344, 20, hwnd, NULL, NULL, NULL);
 
         hLabelEmergencia = CreateWindowExW(0, L"STATIC", L"Emergencia (siempre desarma): F9",
-            WS_CHILD | WS_VISIBLE | SS_CENTER, 10, 58, 260, 18, hwnd, NULL, NULL, NULL);
+            WS_CHILD | WS_VISIBLE | SS_CENTER, 10, 58, 344, 18, hwnd, NULL, NULL, NULL);
 
         hBtnHotkey = CreateWindowExW(0, L"BUTTON", L"Cambiar tecla",
-            WS_CHILD | WS_VISIBLE, 90, 82, 100, 26, hwnd, (HMENU)IDC_BTN_HOTKEY, NULL, NULL);
+            WS_CHILD | WS_VISIBLE, 132, 82, 100, 26, hwnd, (HMENU)IDC_BTN_HOTKEY, NULL, NULL);
 
         hLabelCps = CreateWindowExW(0, L"STATIC", L"CPS: 10.000",
-            WS_CHILD | WS_VISIBLE | SS_CENTER, 10, 118, 260, 20, hwnd, NULL, NULL, NULL);
+            WS_CHILD | WS_VISIBLE | SS_CENTER, 10, 118, 344, 20, hwnd, NULL, NULL, NULL);
 
         hSliderCps = CreateWindowExW(0, TRACKBAR_CLASSW, L"",
-            WS_CHILD | WS_VISIBLE | TBS_HORZ, 10, 142, 260, 30, hwnd, (HMENU)IDC_SLIDER_CPS, NULL, NULL);
+            WS_CHILD | WS_VISIBLE | TBS_HORZ, 10, 142, 344, 30, hwnd, (HMENU)IDC_SLIDER_CPS, NULL, NULL);
         SendMessageW(hSliderCps, TBM_SETRANGE, TRUE, MAKELPARAM(1, 50000));
         SendMessageW(hSliderCps, TBM_SETPOS, TRUE, 10000);
 
@@ -567,13 +645,13 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         hLabelAyuda = CreateWindowExW(0, L"STATIC",
             L"Shift + click en el slider = escribir el n\u00famero a mano.\r\n"
             L"En inventario/men\u00fa no clickea, salvo que mantengas SHIFT.",
-            WS_CHILD | WS_VISIBLE | SS_CENTER, 10, 176, 260, 44, hwnd, NULL, NULL, NULL);
+            WS_CHILD | WS_VISIBLE | SS_CENTER, 10, 176, 344, 32, hwnd, NULL, NULL, NULL);
 
         hLabelDeteccion = CreateWindowExW(0, L"STATIC", L"",
-            WS_CHILD | WS_VISIBLE | SS_CENTER, 10, 226, 260, 32, hwnd, NULL, NULL, NULL);
+            WS_CHILD | WS_VISIBLE | SS_CENTER, 10, 214, 344, 34, hwnd, NULL, NULL, NULL);
 
         hLabelContador = CreateWindowExW(0, L"STATIC", L"Clicks generados: 0",
-            WS_CHILD | WS_VISIBLE | SS_CENTER, 10, 262, 260, 18, hwnd, NULL, NULL, NULL);
+            WS_CHILD | WS_VISIBLE | SS_CENTER, 10, 252, 344, 18, hwnd, NULL, NULL, NULL);
 
         ActualizarLabelHotkey();
 
@@ -591,7 +669,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         }
         break;
     case WM_TIMER:
-        if (wParam == ID_TIMER_CONTADOR) ActualizarDiagnostico();
+        if (wParam == ID_TIMER_CONTADOR) {
+            DetectarWarpDelCursor();
+            ActualizarDiagnostico();
+        }
         break;
     case WM_HSCROLL:
         if ((HWND)lParam == hSliderCps) {
@@ -636,7 +717,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
 
     hMain = CreateWindowExW(0, claseName, L"Autoclicker - C++",
         WS_OVERLAPPEDWINDOW & ~WS_MAXIMIZEBOX & ~WS_THICKFRAME,
-        CW_USEDEFAULT, CW_USEDEFAULT, 300, 340,
+        CW_USEDEFAULT, CW_USEDEFAULT, 380, 320,
         NULL, NULL, hInstance, NULL);
 
     ShowWindow(hMain, nCmdShow);
